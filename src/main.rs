@@ -1,9 +1,7 @@
 #![allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
 use std::{
-    collections::{
-        BTreeMap,
-        HashMap,
-    },
+    collections::HashMap,
+    f32::consts::PI,
     ptr::NonNull,
     sync::{
         mpsc::channel,
@@ -13,12 +11,24 @@ use std::{
 };
 
 use egui::{
+    emath::Rot2,
+    epaint::TextShape,
     mutex::Mutex,
+    text::{
+        LayoutJob,
+        TextWrapping,
+    },
+    Color32,
+    CornerRadius,
+    FontSelection,
     FullOutput,
+    Margin,
     Pos2,
     RawInput,
     Rect,
     RequestRepaintInfo,
+    RichText,
+    Sense,
     Vec2,
     ViewportBuilder,
     ViewportId,
@@ -39,11 +49,20 @@ use egui_wgpu::{
     RenderState,
     ScreenDescriptor,
     SurfaceErrorAction,
-    WgpuConfiguration,
 };
-use river_status_unstable_v1::zriver_status_manager_v1::{
-    self,
-    ZriverStatusManagerV1,
+use river_status_unstable_v1::{
+    zriver_output_status_v1::{
+        self,
+        ZriverOutputStatusV1,
+    },
+    zriver_seat_status_v1::{
+        self,
+        ZriverSeatStatusV1,
+    },
+    zriver_status_manager_v1::{
+        self,
+        ZriverStatusManagerV1,
+    },
 };
 use smithay_client_toolkit::{
     compositor::{
@@ -53,6 +72,7 @@ use smithay_client_toolkit::{
     delegate_compositor,
     delegate_layer,
     delegate_output,
+    delegate_pointer,
     delegate_registry,
     delegate_seat,
     globals::GlobalData,
@@ -84,6 +104,11 @@ use smithay_client_toolkit::{
     },
     registry_handlers,
     seat::{
+        pointer::{
+            PointerData,
+            PointerHandler,
+        },
+        Capability,
         SeatHandler,
         SeatState,
     },
@@ -100,6 +125,7 @@ use smithay_client_toolkit::{
 use tracing::{
     debug,
     info,
+    trace,
     warn,
 };
 use tracing_subscriber::{
@@ -111,10 +137,11 @@ use tracing_subscriber::{
 };
 use wayland_client::protocol::{
     wl_output::WlOutput,
+    wl_seat::WlSeat,
     wl_surface::WlSurface,
 };
 
-const WIDTH: u32 = 60;
+const WIDTH: u32 = 40;
 
 #[allow(clippy::wildcard_imports)]
 pub mod river_control_unstable_v1 {
@@ -169,40 +196,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (globals, mut event_queue) = registry_queue_init(&wayland_conn)?;
     let qh = event_queue.handle();
 
-    let fractional_manager: WpFractionalScaleManagerV1 = globals.bind(&qh, 1..=1, GlobalData)?;
-    let river_status_manager: ZriverStatusManagerV1 = globals.bind(&qh, 4..=4, GlobalData)?;
-
     // Before we can use river status thing, we need to know the current output
     // however that looks to be very annoying, and honestly the best way looks to
     // be simply just letting a different taskbar be rendered per screen attached.
     // Then we can simply just manually specify the output for the bar and all's
     // good with the world.
 
-    let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor not available");
-    let surface = compositor.create_surface(&qh);
-
-    let display_handle = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
-        NonNull::new(wayland_conn.backend().display_ptr().cast()).expect("shitface"),
-    ));
-    let surface_handle = RawWindowHandle::Wayland(WaylandWindowHandle::new(
-        NonNull::new(surface.id().as_ptr().cast()).expect("shitface"),
-    ));
-
-    let layers = LayerShell::bind(&globals, &qh)?;
-    let layer = layers.create_layer_surface(
-        &qh,
-        surface,
-        smithay_client_toolkit::shell::wlr_layer::Layer::Top,
-        Some("desktop-things"),
-        None,
-    );
-
-    layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT);
-    layer.set_exclusive_zone(WIDTH as i32);
-    layer.set_size(WIDTH, 0);
-    layer.commit();
-
-    let (render_state, surface, wgpu_config) = smol::block_on(async {
+    let (render_state, wgpu_config, instance) = smol::block_on(async {
         let setup = egui_wgpu::WgpuSetupCreateNew {
             power_preference: egui_wgpu::wgpu::PowerPreference::LowPower,
             ..Default::default()
@@ -211,12 +211,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let instance = egui_wgpu::WgpuSetup::CreateNew(setup.clone())
             .new_instance()
             .await;
-        let surface = unsafe {
-            instance.create_surface_unsafe(egui_wgpu::wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle: display_handle,
-                raw_window_handle:  surface_handle,
-            })?
-        };
 
         let wgpu_config = egui_wgpu::WgpuConfiguration {
             wgpu_setup: setup.into(),
@@ -224,10 +218,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let state =
-            egui_wgpu::RenderState::create(&wgpu_config, &instance, Some(&surface), None, 1, false)
-                .await?;
+            egui_wgpu::RenderState::create(&wgpu_config, &instance, None, None, 1, false).await?;
 
-        Ok::<_, Box<dyn std::error::Error>>((state, surface, wgpu_config))
+        Ok::<_, Box<dyn std::error::Error>>((state, wgpu_config, instance))
     })?;
 
     let render_state = Arc::new(render_state);
@@ -238,39 +231,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut taskbar = Taskbar {
         registry: RegistryState::new(&globals),
-        seat:     SeatState::new(&globals, &qh),
-        output:   OutputState::new(&globals, &qh),
+        seat: SeatState::new(&globals, &qh),
+        output: OutputState::new(&globals, &qh),
 
-        context:      context.clone(),
-        input:        input.clone(),
+        compositor: CompositorState::bind(&globals, &qh)?,
+        layers: LayerShell::bind(&globals, &qh)?,
+        fractional: globals.bind(&qh, 1..=1, GlobalData)?,
+
+        river_status: globals.bind(&qh, 4..=4, GlobalData)?,
+        river_outputs: HashMap::new(),
+        river_focus: HashMap::new(),
+
+        context: context.clone(),
+        input: input.clone(),
         render_state: render_state.clone(),
+        instance,
 
         viewports: Arc::new(Mutex::new(HashMap::new())),
-        surfaces:  HashMap::new(),
+        surfaces: HashMap::new(),
     };
-
-    let root_taskbar_viewport = ViewportId::from_hash_of("source");
-    taskbar
-        .viewports
-        .lock()
-        .insert(root_taskbar_viewport, Viewport {
-            parent: taskbar.output.outputs().next().expect("no outputs"),
-            surface,
-            size: (WIDTH, 0),
-        });
-    taskbar
-        .surfaces
-        .insert(layer.wl_surface().clone(), root_taskbar_viewport);
-
-    context.show_viewport_deferred(
-        root_taskbar_viewport,
-        ViewportBuilder::default(),
-        |ctx, _| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.label("Hello World!");
-            });
-        },
-    );
 
     let (request_send, request_recv) = channel();
 
@@ -279,6 +258,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let viewports = taskbar.viewports.clone();
+    #[allow(clippy::significant_drop_tightening)]
     std::thread::spawn(move || {
         while let Ok(RequestRepaintInfo {
             viewport_id,
@@ -288,15 +268,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             std::thread::sleep(delay); // TODO: Nicer delay
 
-            // TODO: Build viewport if doesn't exist
-            info!("Frame");
+            // TODO: Build viewport if doesn't exist (mini viewports summoned on the fly)
+            trace!(id = ?viewport_id, "Rendering viewport frame");
 
             // Grab requested viewport
             let Some(callback) = context.viewport_for(viewport_id, |viewport_state| {
                 viewport_state.viewport_ui_cb.clone()
             }) else {
                 debug!("Immediate viewport requested repaint");
-                return;
+                continue;
             };
 
             // Get input since last redraw
@@ -305,7 +285,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let viewports = viewports.lock();
             let Some(viewport) = viewports.get(&viewport_id) else {
                 warn!("Viewport missing");
-                return;
+                continue;
             };
 
             // Update usable area
@@ -341,34 +321,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let prims = context.tessellate(shapes, pixels_per_point);
 
-            let surface_texture = match viewport.surface.get_current_texture() {
-                Ok(frame) => frame,
-                Err(err) => match (*wgpu_config.on_surface_error)(err) {
-                    SurfaceErrorAction::RecreateSurface => {
-                        viewport.configure_surface(
-                            &render_state.adapter,
-                            &render_state.device,
-                            render_state.target_format,
-                            PresentMode::Mailbox,
-                        );
-                        info!("Recreated Surface");
-                        return;
-                    },
-                    SurfaceErrorAction::SkipFrame => {
-                        info!("Skipped Frame");
-                        return;
-                    },
-                },
-            };
-            let surface_view = surface_texture
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor::default());
-
             let screen_desc = ScreenDescriptor {
                 size_in_pixels: viewport.size.into(),
                 pixels_per_point,
             };
-            drop(viewports);
 
             let mut encoder = render_state
                 .device
@@ -395,7 +351,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
             };
 
-            {
+            if width == 0 || height == 0 {
+                warn!("Viewport not configured");
+
+                render_state.queue.submit(buffer_commands.into_iter());
+            } else {
+                let surface_texture = match viewport.surface.get_current_texture() {
+                    Ok(frame) => frame,
+                    Err(err) => match (*wgpu_config.on_surface_error)(err) {
+                        SurfaceErrorAction::RecreateSurface => {
+                            trace!("WGpu requested surface reconfiguration");
+                            viewport.configure_surface(
+                                &render_state.adapter,
+                                &render_state.device,
+                                render_state.target_format,
+                                wgpu_config.present_mode,
+                            );
+                            continue;
+                        },
+                        SurfaceErrorAction::SkipFrame => {
+                            trace!("Skipped Frame");
+                            continue;
+                        },
+                    },
+                };
+                let surface_view = surface_texture
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+
                 let renderer = render_state.renderer.read();
 
                 let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -404,7 +387,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         view:           &surface_view,
                         resolve_target: None,
                         ops:            wgpu::Operations {
-                            load:  wgpu::LoadOp::Clear(wgpu::Color::BLUE),
+                            load:  wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -414,13 +397,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
 
                 renderer.render(&mut render_pass.forget_lifetime(), &prims, &screen_desc);
-            }
 
-            // Submit the command in the queue to execute
-            render_state
-                .queue
-                .submit(buffer_commands.into_iter().chain([encoder.finish()]));
-            surface_texture.present();
+                // Submit the command in the queue to execute
+                render_state
+                    .queue
+                    .submit(buffer_commands.into_iter().chain([encoder.finish()]));
+                surface_texture.present();
+            }
 
             {
                 let mut renderer = render_state.renderer.write();
@@ -439,7 +422,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 struct Viewport {
-    parent:  WlOutput,
+    parent: WlOutput,
+    layer:  LayerSurface,
+
     surface: wgpu::Surface<'static>,
     size:    (u32, u32),
 }
@@ -458,7 +443,7 @@ impl Viewport {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: target_format,
             present_mode,
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            alpha_mode: wgpu::CompositeAlphaMode::PreMultiplied,
             view_formats: vec![target_format],
             ..self
                 .surface
@@ -469,13 +454,37 @@ impl Viewport {
     }
 }
 
+impl Drop for Viewport {
+    fn drop(&mut self) {
+        self.layer.wl_surface().destroy();
+    }
+}
+
+struct RiverOutputStatus {
+    used:    u32,
+    focused: u32,
+    urgent:  u32,
+
+    view_title: String,
+}
+
 struct Taskbar {
+    instance:     wgpu::Instance,
     render_state: Arc<RenderState>,
-    context:      egui::Context,
-    input:        Arc<Mutex<RawInput>>,
+
+    context: egui::Context,
+    input:   Arc<Mutex<RawInput>>,
 
     viewports: Arc<Mutex<HashMap<ViewportId, Viewport>>>,
     surfaces:  HashMap<WlSurface, ViewportId>,
+
+    compositor: CompositorState,
+    layers:     LayerShell,
+    fractional: WpFractionalScaleManagerV1,
+
+    river_status:  ZriverStatusManagerV1,
+    river_outputs: HashMap<WlOutput, Arc<Mutex<RiverOutputStatus>>>,
+    river_focus:   HashMap<WlSeat, WlOutput>,
 
     registry: RegistryState,
     seat:     SeatState,
@@ -522,7 +531,7 @@ impl Dispatch<WpFractionalScaleV1, WlOutput> for Taskbar {
                         .and_modify(|viewport| viewport.native_pixels_per_point = Some(scale));
                 }
 
-                debug!(scale, "Updated Fractional Scale");
+                debug!(scale, "Updated Scale Factor (fractional)");
             },
             _ => unreachable!("There shouldn't be any other events"),
         }
@@ -542,6 +551,99 @@ impl Dispatch<ZriverStatusManagerV1, GlobalData> for Taskbar {
     }
 }
 
+impl Dispatch<ZriverOutputStatusV1, WlOutput> for Taskbar {
+    fn event(
+        state: &mut Self,
+        _proxy: &ZriverOutputStatusV1,
+        event: zriver_output_status_v1::Event,
+        focused: &WlOutput,
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        debug!(?event);
+
+        let Some(status) = state.river_outputs.get_mut(focused) else {
+            warn!("River returning info about unknown Output");
+            return;
+        };
+        {
+            let mut status = status.lock();
+
+            match event {
+                zriver_output_status_v1::Event::FocusedTags { tags } => {
+                    // Currently showing
+                    status.focused = tags;
+                },
+                zriver_output_status_v1::Event::UrgentTags { tags } => {
+                    // Notifications
+                    status.urgent = tags;
+                },
+                zriver_output_status_v1::Event::ViewTags { tags } => {
+                    // List of views & their tags
+                    let views: &[u32] = bytemuck::cast_slice(&tags); // TODO: Do nicer things later with this info
+                    status.used = views.iter().fold(0u32, |acc, v| acc | v);
+                },
+                _ => {}, // We don't need the layout info
+            }
+        }
+
+        for (id, _) in state
+            .viewports
+            .lock()
+            .iter()
+            .filter(|(_, viewport)| viewport.parent == *focused)
+        {
+            state.context.request_repaint_of(*id);
+        }
+    }
+}
+
+impl Dispatch<ZriverSeatStatusV1, WlSeat> for Taskbar {
+    #[allow(clippy::significant_drop_tightening)]
+    fn event(
+        state: &mut Self,
+        _proxy: &ZriverSeatStatusV1,
+        event: zriver_seat_status_v1::Event,
+        seat: &WlSeat,
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        match event {
+            zriver_seat_status_v1::Event::FocusedOutput { output } => {
+                state.river_focus.insert(seat.clone(), output);
+            },
+            zriver_seat_status_v1::Event::UnfocusedOutput { output: _ } => {
+                // Assuming seat cannot focus more than one output (for convenience sake)
+                state.river_focus.remove(seat);
+            },
+            zriver_seat_status_v1::Event::FocusedView { title } => {
+                let focused = state
+                    .river_focus
+                    .get(seat)
+                    .expect("Seat not attached to Output focused on View");
+
+                let Some(status) = state.river_outputs.get_mut(focused) else {
+                    warn!("Seat attached to unknown Output");
+                    return;
+                };
+
+                status.lock().view_title = title;
+                for (id, _) in state
+                    .viewports
+                    .lock()
+                    .iter()
+                    .filter(|(_, viewport)| viewport.parent == *focused)
+                {
+                    state.context.request_repaint_of(*id);
+                }
+            },
+            zriver_seat_status_v1::Event::Mode { name: _ } => {
+                // Unused
+            },
+        }
+    }
+}
+
 impl LayerShellHandler for Taskbar {
     fn closed(
         &mut self,
@@ -549,40 +651,37 @@ impl LayerShellHandler for Taskbar {
         _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
         _layer: &smithay_client_toolkit::shell::wlr_layer::LayerSurface,
     ) {
-        // Unused
+        // TODO: Handle layer closing
     }
 
     fn configure(
         &mut self,
         _conn: &Connection,
-        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
         layer: &smithay_client_toolkit::shell::wlr_layer::LayerSurface,
         configure: smithay_client_toolkit::shell::wlr_layer::LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        info!(new_size = ?configure.new_size, "Configuring WGpu instance with updated size");
-
-        let Some(&viewport_id) = self.surfaces.get(layer.wl_surface()) else {
+        let Some(viewport_id) = self.surfaces.get(layer.wl_surface()) else {
             return;
         };
-        self.viewports
-            .lock()
-            .entry(viewport_id)
-            .and_modify(|viewport| {
-                let first_draw = viewport.size.1 == 0;
 
-                viewport.size = configure.new_size;
-                viewport.configure_surface(
-                    &self.render_state.adapter,
-                    &self.render_state.device,
-                    self.render_state.target_format,
-                    PresentMode::Mailbox,
-                );
+        if let Some(viewport) = self.viewports.lock().get_mut(viewport_id) {
+            let first_draw = viewport.size.1 == 0;
 
-                if first_draw {
-                    self.context.request_repaint_of(viewport_id);
-                }
-            });
+            viewport.size = configure.new_size;
+            viewport.configure_surface(
+                &self.render_state.adapter,
+                &self.render_state.device,
+                self.render_state.target_format,
+                PresentMode::AutoVsync,
+            );
+            debug!(new_size = ?configure.new_size, "Viewport resized");
+
+            if first_draw {
+                self.context.request_repaint_of(*viewport_id);
+            }
+        }
 
         /*
         let first_draw = self.size.1 == 0;
@@ -629,7 +728,7 @@ impl CompositorHandler for Taskbar {
                 {
                     viewport.native_pixels_per_point = Some(new_factor as f32);
 
-                    debug!(scale = new_factor, "Updated Integer Scale");
+                    debug!(scale = new_factor, "Updated Scale Factor (integer)");
                 }
             });
     }
@@ -641,7 +740,7 @@ impl CompositorHandler for Taskbar {
         _surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
         _new_transform: smithay_client_toolkit::reexports::client::protocol::wl_output::Transform,
     ) {
-        // Unused
+        // TODO: Allow rotation of UI to align with orientation of output
     }
 
     fn frame(
@@ -683,13 +782,144 @@ impl OutputHandler for Taskbar {
         &mut self.output
     }
 
+    #[allow(clippy::too_many_lines)]
     fn new_output(
         &mut self,
-        _conn: &Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _output: smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput,
+        conn: &Connection,
+        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        output: smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput,
     ) {
-        // Unused
+        // Spawn new Taskbar on output
+        debug!(id = ?output.id(), "Initalizing taskbar frame for new output");
+        let surface = self.compositor.create_surface(qh);
+
+        self.fractional
+            .get_fractional_scale(&surface, qh, output.clone());
+
+        self.river_status
+            .get_river_output_status(&output, qh, output.clone());
+
+        let display_handle = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
+            NonNull::new(conn.backend().display_ptr().cast()).expect("shitface"),
+        ));
+        let surface_handle = RawWindowHandle::Wayland(WaylandWindowHandle::new(
+            NonNull::new(surface.id().as_ptr().cast()).expect("shitface"),
+        ));
+
+        let layer = self.layers.create_layer_surface(
+            qh,
+            surface,
+            smithay_client_toolkit::shell::wlr_layer::Layer::Top,
+            Some("desktop-things"),
+            Some(&output),
+        );
+
+        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT);
+        layer.set_exclusive_zone(WIDTH as i32);
+        layer.set_size(WIDTH, 0);
+        layer.commit();
+
+        let surface = unsafe {
+            self.instance
+                .create_surface_unsafe(egui_wgpu::wgpu::SurfaceTargetUnsafe::RawHandle {
+                    raw_display_handle: display_handle,
+                    raw_window_handle:  surface_handle,
+                })
+                .expect("Failed to create surface")
+        };
+
+        let root_taskbar_viewport = ViewportId::from_hash_of(&output);
+        self.surfaces
+            .insert(layer.wl_surface().clone(), root_taskbar_viewport);
+        self.viewports
+            .lock()
+            .insert(root_taskbar_viewport, Viewport {
+                parent: output.clone(),
+                layer,
+                surface,
+                size: (WIDTH, 0),
+            });
+
+        let river_status = Arc::new(Mutex::new(RiverOutputStatus {
+            used:       0,
+            focused:    0,
+            urgent:     0,
+            view_title: String::new(),
+        }));
+
+        self.river_outputs.insert(output, river_status.clone());
+
+        // TODO: Move this ui func somewhere else
+        self.context.show_viewport_deferred(
+            root_taskbar_viewport,
+            ViewportBuilder::default()
+                .with_transparent(true)
+                .with_decorations(false),
+            move |ctx, _| {
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::new()
+                            .inner_margin(Margin::symmetric(2, 0))
+                            .corner_radius(CornerRadius::same(10))
+                            .fill(egui::Color32::from_gray(0xaa).gamma_multiply(0.3)),
+                    )
+                    .show(ctx, |ui| {
+                        let river_status = river_status.lock();
+
+                        ui.vertical_centered(|ui| {
+                            egui::Frame::new()
+                                .inner_margin(Margin::symmetric(2, 4))
+                                .outer_margin(Margin::symmetric(2, 2))
+                                .corner_radius(CornerRadius::same(4))
+                                .fill(egui::Color32::from_gray(50))
+                                .show(ui, |ui| {
+                                    let mut job = LayoutJob {
+                                        wrap: TextWrapping::from_wrap_mode_and_width(
+                                            egui::TextWrapMode::Truncate,
+                                            100.0,
+                                        ),
+                                        ..Default::default()
+                                    };
+                                    RichText::new(river_status.view_title.as_str())
+                                        .size(16.0)
+                                        .strong()
+                                        .color(Color32::WHITE)
+                                        .append_to(
+                                            &mut job,
+                                            ui.style(),
+                                            FontSelection::Default,
+                                            egui::Align::Center,
+                                        );
+
+                                    let galley = ui.painter().layout_job(job);
+
+                                    let rotation = Rot2::from_angle(PI / 2.0);
+
+                                    let (rect, _) = {
+                                        let bounding_rect =
+                                            Rect::from_center_size(Pos2::ZERO, galley.size())
+                                                .rotate_bb(rotation);
+                                        ui.allocate_exact_size(bounding_rect.size(), Sense::empty())
+                                    };
+
+                                    if ui.is_rect_visible(rect) {
+                                        let pos =
+                                            rect.center() - (rotation * (galley.size() / 2.0));
+
+                                        ui.painter().add(TextShape {
+                                            angle: PI / 2.0,
+                                            ..TextShape::new(
+                                                pos,
+                                                galley,
+                                                egui::Color32::PLACEHOLDER,
+                                            )
+                                        });
+                                    }
+                                })
+                        });
+                    });
+            },
+        );
     }
 
     fn update_output(
@@ -705,9 +935,23 @@ impl OutputHandler for Taskbar {
         &mut self,
         _conn: &Connection,
         _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _output: smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput,
+        output: smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput,
     ) {
-        // Unused
+        // Drop all surfaces associated with output
+        self.viewports.lock().retain(|id, viewport| {
+            if viewport.parent == output {
+                let _ = self.input.lock().viewports.remove(id);
+                self.surfaces.remove(viewport.layer.wl_surface());
+                viewport.layer.wl_surface().destroy();
+
+                false
+            } else {
+                true
+            }
+        });
+
+        // Probably not needed?
+        output.release();
     }
 }
 
@@ -719,20 +963,29 @@ impl SeatHandler for Taskbar {
     fn new_seat(
         &mut self,
         _conn: &Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _seat: smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat,
+        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        seat: smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat,
     ) {
-        // Unused
+        info!(?seat, "New Seat");
+        self.river_status
+            .get_river_seat_status(&seat, qh, seat.clone());
     }
 
     fn new_capability(
         &mut self,
         _conn: &Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _seat: smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat,
-        _capability: smithay_client_toolkit::seat::Capability,
+        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        seat: smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat,
+        capability: smithay_client_toolkit::seat::Capability,
     ) {
-        // Unused
+        // Tell river to add seat if not already added
+        self.river_status
+            .get_river_seat_status(&seat, qh, seat.clone());
+
+        //trace!(?seat, ?capability, "Updated seat capability");
+        if matches!(capability, Capability::Pointer) {
+            let _pointer = seat.get_pointer(qh, PointerData::new(seat.clone()));
+        }
     }
 
     fn remove_capability(
@@ -755,11 +1008,24 @@ impl SeatHandler for Taskbar {
     }
 }
 
+impl PointerHandler for Taskbar {
+    fn pointer_frame(
+        &mut self,
+        _conn: &Connection,
+        _qh: &wayland_client::QueueHandle<Self>,
+        _pointer: &wayland_client::protocol::wl_pointer::WlPointer,
+        _events: &[smithay_client_toolkit::seat::pointer::PointerEvent],
+    ) {
+        // TODO: Update EGui RawInput with pointer frame
+    }
+}
+
 delegate_registry!(Taskbar);
 delegate_seat!(Taskbar);
 delegate_output!(Taskbar);
 delegate_compositor!(Taskbar);
 delegate_layer!(Taskbar);
+delegate_pointer!(Taskbar);
 
 impl ProvidesRegistryState for Taskbar {
     registry_handlers![OutputState, SeatState,];

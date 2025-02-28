@@ -20,6 +20,8 @@ wayland-scanner = "*"
 wayland-client = "*"
 smol = "2.0"
 
+bytemuck = "1.21"
+
 [lints.clippy]
 enum_glob_use = "deny"
 pedantic = "deny"
