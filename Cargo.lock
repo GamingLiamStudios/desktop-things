@@ -425,6 +425,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui_extras",
+ "futures-lite",
  "smithay-client-toolkit",
  "smol",
  "tracing",

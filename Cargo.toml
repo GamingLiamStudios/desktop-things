@@ -21,6 +21,7 @@ wayland-client = "*"
 smol = "2.0"
 
 bytemuck = "1.21"
+futures-lite = "2.6"
 
 [lints.clippy]
 enum_glob_use = "deny"

@@ -2,11 +2,22 @@
 use std::{
     collections::HashMap,
     f32::consts::PI,
+    io::ErrorKind,
+    os::{
+        fd::{
+            AsFd,
+            AsRawFd,
+            FromRawFd,
+            RawFd,
+        },
+        unix::net::UnixStream,
+    },
     ptr::NonNull,
     sync::{
         mpsc::channel,
         Arc,
     },
+    task,
     time::Duration,
 };
 
@@ -22,7 +33,10 @@ use egui::{
     CornerRadius,
     FontSelection,
     FullOutput,
+    Layout,
     Margin,
+    Modifiers,
+    PointerButton,
     Pos2,
     RawInput,
     Rect,
@@ -50,6 +64,7 @@ use egui_wgpu::{
     ScreenDescriptor,
     SurfaceErrorAction,
 };
+use futures_lite::FutureExt;
 use river_status_unstable_v1::{
     zriver_output_status_v1::{
         self,
@@ -106,7 +121,13 @@ use smithay_client_toolkit::{
     seat::{
         pointer::{
             PointerData,
+            PointerEvent,
             PointerHandler,
+            BTN_EXTRA,
+            BTN_LEFT,
+            BTN_MIDDLE,
+            BTN_RIGHT,
+            BTN_SIDE,
         },
         Capability,
         SeatHandler,
@@ -122,6 +143,11 @@ use smithay_client_toolkit::{
         WaylandSurface,
     },
 };
+use smol::{
+    Async,
+    Executor,
+    LocalExecutor,
+};
 use tracing::{
     debug,
     info,
@@ -135,10 +161,14 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
     Layer,
 };
-use wayland_client::protocol::{
-    wl_output::WlOutput,
-    wl_seat::WlSeat,
-    wl_surface::WlSurface,
+use wayland_backend::client::WaylandError;
+use wayland_client::{
+    protocol::{
+        wl_output::WlOutput,
+        wl_seat::WlSeat,
+        wl_surface::WlSurface,
+    },
+    DispatchError,
 };
 
 const WIDTH: u32 = 40;
@@ -183,7 +213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(
             stdout_log.with_filter(
                 Targets::default()
-                    .with_target("desktop_things", tracing::Level::TRACE)
+                    .with_target("desktop_things", tracing::Level::DEBUG)
                     .with_target("wgpu", tracing::Level::WARN)
                     .with_target("egui", tracing::Level::WARN)
                     .with_target("eframe", tracing::Level::WARN)
@@ -202,7 +232,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Then we can simply just manually specify the output for the bar and all's
     // good with the world.
 
-    let (render_state, wgpu_config, instance) = smol::block_on(async {
+    smol::block_on(async {
         let setup = egui_wgpu::WgpuSetupCreateNew {
             power_preference: egui_wgpu::wgpu::PowerPreference::LowPower,
             ..Default::default()
@@ -217,208 +247,216 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         };
 
-        let state =
+        let render_state =
             egui_wgpu::RenderState::create(&wgpu_config, &instance, None, None, 1, false).await?;
 
-        Ok::<_, Box<dyn std::error::Error>>((state, wgpu_config, instance))
-    })?;
+        let render_state = Arc::new(render_state);
+        let input = Arc::new(Mutex::new(RawInput::default()));
+        let context = egui::Context::default();
+        context.set_os(egui::os::OperatingSystem::Nix);
+        context.set_embed_viewports(false);
 
-    let render_state = Arc::new(render_state);
-    let input = Arc::new(Mutex::new(RawInput::default()));
-    let context = egui::Context::default();
-    context.set_os(egui::os::OperatingSystem::Nix);
-    context.set_embed_viewports(false);
+        let mut taskbar = Taskbar {
+            registry: RegistryState::new(&globals),
+            seat: SeatState::new(&globals, &qh),
+            output: OutputState::new(&globals, &qh),
 
-    let mut taskbar = Taskbar {
-        registry: RegistryState::new(&globals),
-        seat: SeatState::new(&globals, &qh),
-        output: OutputState::new(&globals, &qh),
+            compositor: CompositorState::bind(&globals, &qh)?,
+            layers: LayerShell::bind(&globals, &qh)?,
+            fractional: globals.bind(&qh, 1..=1, GlobalData)?,
 
-        compositor: CompositorState::bind(&globals, &qh)?,
-        layers: LayerShell::bind(&globals, &qh)?,
-        fractional: globals.bind(&qh, 1..=1, GlobalData)?,
+            river_status: globals.bind(&qh, 4..=4, GlobalData)?,
+            river_outputs: HashMap::new(),
+            river_focus: HashMap::new(),
 
-        river_status: globals.bind(&qh, 4..=4, GlobalData)?,
-        river_outputs: HashMap::new(),
-        river_focus: HashMap::new(),
+            context: context.clone(),
+            input: input.clone(),
+            render_state: render_state.clone(),
+            instance,
 
-        context: context.clone(),
-        input: input.clone(),
-        render_state: render_state.clone(),
-        instance,
+            viewports: Arc::new(Mutex::new(HashMap::new())),
+            surfaces: HashMap::new(),
+        };
 
-        viewports: Arc::new(Mutex::new(HashMap::new())),
-        surfaces: HashMap::new(),
-    };
+        event_queue.roundtrip(&mut taskbar)?;
 
-    let (request_send, request_recv) = channel();
+        let exec = Arc::new(Executor::new());
+        let viewports = taskbar.viewports.clone();
 
-    context.set_request_repaint_callback(move |repaint_req| {
-        let _ = request_send.send(repaint_req);
-    });
+        let executor = exec.clone();
+        taskbar.context.set_request_repaint_callback(
+            move |RequestRepaintInfo {
+                      viewport_id,
+                      delay,
+                      current_cumulative_pass_nr: _, // I would use this but it seems to deadlock
+                  }| {
+                let context = context.clone();
+                let input = input.clone();
+                let viewports = viewports.clone();
+                let render_state = render_state.clone();
+                let wgpu_config = wgpu_config.clone();
 
-    let viewports = taskbar.viewports.clone();
-    #[allow(clippy::significant_drop_tightening)]
-    std::thread::spawn(move || {
-        while let Ok(RequestRepaintInfo {
-            viewport_id,
-            delay,
-            current_cumulative_pass_nr: _,
-        }) = request_recv.recv()
-        {
-            std::thread::sleep(delay); // TODO: Nicer delay
+                exec.spawn(async move {
+                    smol::Timer::after(delay).await;
 
-            // TODO: Build viewport if doesn't exist (mini viewports summoned on the fly)
-            trace!(id = ?viewport_id, "Rendering viewport frame");
+                    // TODO: Build viewport if doesn't exist (tooltips)
+                    trace!(id = ?viewport_id, "Rendering viewport frame");
 
-            // Grab requested viewport
-            let Some(callback) = context.viewport_for(viewport_id, |viewport_state| {
-                viewport_state.viewport_ui_cb.clone()
-            }) else {
-                debug!("Immediate viewport requested repaint");
-                continue;
-            };
+                    // Grab requested viewport
+                    let Some(callback) = context.viewport_for(viewport_id, |viewport_state| {
+                        viewport_state.viewport_ui_cb.clone()
+                    }) else {
+                        debug!("Immediate viewport requested repaint");
+                        return;
+                    };
 
-            // Get input since last redraw
-            let mut input = input.lock().take();
+                    // Get input since last redraw
+                    let mut input = input.lock().take();
 
-            let viewports = viewports.lock();
-            let Some(viewport) = viewports.get(&viewport_id) else {
-                warn!("Viewport missing");
-                continue;
-            };
+                    let viewports = viewports.lock();
+                    let Some(viewport) = viewports.get(&viewport_id) else {
+                        warn!("Viewport missing");
+                        return;
+                    };
 
-            // Update usable area
-            let (width, height) = viewport.size;
+                    // Update usable area
+                    let (width, height) = viewport.size;
 
-            let scale_factor = input
-                .viewports
-                .entry(viewport_id)
-                .or_default()
-                .native_pixels_per_point
-                .unwrap_or(1.0);
+                    let scale_factor = input
+                        .viewports
+                        .entry(viewport_id)
+                        .or_default()
+                        .native_pixels_per_point
+                        .unwrap_or(1.0);
 
-            let pixels_per_point = context.zoom_factor() * scale_factor;
-            input.screen_rect = (width > 0 && height > 0).then(|| {
-                Rect::from_min_size(
-                    Pos2::ZERO,
-                    Vec2::new(
-                        width as f32 / pixels_per_point,
-                        height as f32 / pixels_per_point,
-                    ),
-                )
-            });
+                    let pixels_per_point = context.zoom_factor() * scale_factor;
+                    input.screen_rect = (width > 0 && height > 0).then(|| {
+                        Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(
+                                width as f32 / pixels_per_point,
+                                height as f32 / pixels_per_point,
+                            ),
+                        )
+                    });
 
-            input.viewport_id = viewport_id;
+                    input.viewport_id = viewport_id;
 
-            let FullOutput {
-                platform_output: _,
-                textures_delta,
-                shapes,
-                pixels_per_point,
-                viewport_output: _,
-            } = context.run(input, callback.as_ref());
+                    let FullOutput {
+                        platform_output: _,
+                        textures_delta,
+                        shapes,
+                        pixels_per_point,
+                        viewport_output: _,
+                    } = context.run(input, callback.as_ref());
 
-            let prims = context.tessellate(shapes, pixels_per_point);
+                    let prims = context.tessellate(shapes, pixels_per_point);
 
-            let screen_desc = ScreenDescriptor {
-                size_in_pixels: viewport.size.into(),
-                pixels_per_point,
-            };
+                    let screen_desc = ScreenDescriptor {
+                        size_in_pixels: viewport.size.into(),
+                        pixels_per_point,
+                    };
 
-            let mut encoder = render_state
-                .device
-                .create_command_encoder(&CommandEncoderDescriptor::default());
+                    let mut encoder = render_state
+                        .device
+                        .create_command_encoder(&CommandEncoderDescriptor::default());
 
-            let buffer_commands = {
-                let mut renderer = render_state.renderer.write();
+                    let buffer_commands = {
+                        let mut renderer = render_state.renderer.write();
 
-                for (id, image_delta) in textures_delta.set {
-                    renderer.update_texture(
-                        &render_state.device,
-                        &render_state.queue,
-                        id,
-                        &image_delta,
-                    );
-                }
-
-                renderer.update_buffers(
-                    &render_state.device,
-                    &render_state.queue,
-                    &mut encoder,
-                    &prims,
-                    &screen_desc,
-                )
-            };
-
-            if width == 0 || height == 0 {
-                warn!("Viewport not configured");
-
-                render_state.queue.submit(buffer_commands.into_iter());
-            } else {
-                let surface_texture = match viewport.surface.get_current_texture() {
-                    Ok(frame) => frame,
-                    Err(err) => match (*wgpu_config.on_surface_error)(err) {
-                        SurfaceErrorAction::RecreateSurface => {
-                            trace!("WGpu requested surface reconfiguration");
-                            viewport.configure_surface(
-                                &render_state.adapter,
+                        for (id, image_delta) in textures_delta.set {
+                            renderer.update_texture(
                                 &render_state.device,
-                                render_state.target_format,
-                                wgpu_config.present_mode,
+                                &render_state.queue,
+                                id,
+                                &image_delta,
                             );
-                            continue;
-                        },
-                        SurfaceErrorAction::SkipFrame => {
-                            trace!("Skipped Frame");
-                            continue;
-                        },
-                    },
-                };
-                let surface_view = surface_texture
-                    .texture
-                    .create_view(&wgpu::TextureViewDescriptor::default());
+                        }
 
-                let renderer = render_state.renderer.read();
+                        renderer.update_buffers(
+                            &render_state.device,
+                            &render_state.queue,
+                            &mut encoder,
+                            &prims,
+                            &screen_desc,
+                        )
+                    };
 
-                let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label:                    None,
-                    color_attachments:        &[Some(wgpu::RenderPassColorAttachment {
-                        view:           &surface_view,
-                        resolve_target: None,
-                        ops:            wgpu::Operations {
-                            load:  wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes:         None,
-                    occlusion_query_set:      None,
-                });
+                    if width == 0 || height == 0 {
+                        warn!("Viewport not configured");
 
-                renderer.render(&mut render_pass.forget_lifetime(), &prims, &screen_desc);
+                        render_state.queue.submit(buffer_commands);
+                    } else {
+                        let surface_texture = match viewport.surface.get_current_texture() {
+                            Ok(frame) => frame,
+                            Err(err) => match (*wgpu_config.on_surface_error)(err) {
+                                SurfaceErrorAction::RecreateSurface => {
+                                    trace!("WGpu requested surface reconfiguration");
+                                    viewport.configure_surface(
+                                        &render_state.adapter,
+                                        &render_state.device,
+                                        render_state.target_format,
+                                        wgpu_config.present_mode,
+                                    );
+                                    return;
+                                },
+                                SurfaceErrorAction::SkipFrame => {
+                                    trace!("Skipped Frame");
+                                    return;
+                                },
+                            },
+                        };
+                        let surface_view = surface_texture
+                            .texture
+                            .create_view(&wgpu::TextureViewDescriptor::default());
 
-                // Submit the command in the queue to execute
-                render_state
-                    .queue
-                    .submit(buffer_commands.into_iter().chain([encoder.finish()]));
-                surface_texture.present();
-            }
+                        let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label:                    None,
+                            color_attachments:        &[Some(wgpu::RenderPassColorAttachment {
+                                view:           &surface_view,
+                                resolve_target: None,
+                                ops:            wgpu::Operations {
+                                    load:  wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes:         None,
+                            occlusion_query_set:      None,
+                        });
 
-            {
-                let mut renderer = render_state.renderer.write();
-                for id in textures_delta.free {
-                    renderer.free_texture(&id);
-                }
-            }
-        }
-    });
+                        render_state.renderer.read().render(
+                            &mut render_pass.forget_lifetime(),
+                            &prims,
+                            &screen_desc,
+                        );
 
-    loop {
-        event_queue
-            .blocking_dispatch(&mut taskbar)
-            .expect("shitface");
-    }
+                        // Submit the command in the queue to execute
+                        render_state
+                            .queue
+                            .submit(buffer_commands.into_iter().chain([encoder.finish()]));
+                        surface_texture.present();
+                    }
+
+                    {
+                        let mut renderer = render_state.renderer.write();
+                        for id in textures_delta.free {
+                            renderer.free_texture(&id);
+                        }
+                    }
+                })
+                .detach();
+            },
+        );
+
+        executor
+            .run(smol::unblock::<Result<_, DispatchError>, _>(move || loop {
+                event_queue.blocking_dispatch(&mut taskbar)?;
+            }))
+            .await?;
+
+        Ok(())
+    })
 }
 
 struct Viewport {
@@ -856,6 +894,12 @@ impl OutputHandler for Taskbar {
                 .with_transparent(true)
                 .with_decorations(false),
             move |ctx, _| {
+                let frame = egui::Frame::new()
+                    .inner_margin(Margin::symmetric(2, 4))
+                    .outer_margin(Margin::symmetric(2, 2))
+                    .corner_radius(CornerRadius::same(10))
+                    .fill(egui::Color32::from_gray(50));
+
                 egui::CentralPanel::default()
                     .frame(
                         egui::Frame::new()
@@ -866,57 +910,70 @@ impl OutputHandler for Taskbar {
                     .show(ctx, |ui| {
                         let river_status = river_status.lock();
 
+                        let total_vertical = ui.available_height();
+
                         ui.vertical_centered(|ui| {
-                            egui::Frame::new()
-                                .inner_margin(Margin::symmetric(2, 4))
-                                .outer_margin(Margin::symmetric(2, 2))
-                                .corner_radius(CornerRadius::same(4))
-                                .fill(egui::Color32::from_gray(50))
-                                .show(ui, |ui| {
-                                    let mut job = LayoutJob {
-                                        wrap: TextWrapping::from_wrap_mode_and_width(
-                                            egui::TextWrapMode::Truncate,
-                                            100.0,
-                                        ),
-                                        ..Default::default()
-                                    };
-                                    RichText::new(river_status.view_title.as_str())
-                                        .size(16.0)
-                                        .strong()
-                                        .color(Color32::WHITE)
-                                        .append_to(
-                                            &mut job,
-                                            ui.style(),
-                                            FontSelection::Default,
-                                            egui::Align::Center,
-                                        );
+                            frame.show(ui, |ui| {
+                                let mut job = LayoutJob {
+                                    wrap: TextWrapping::from_wrap_mode_and_width(
+                                        egui::TextWrapMode::Truncate,
+                                        ui.available_height() / 3.0,
+                                    ),
+                                    ..Default::default()
+                                };
+                                RichText::new(river_status.view_title.as_str())
+                                    .size(16.0)
+                                    .strong()
+                                    .color(Color32::WHITE)
+                                    .append_to(
+                                        &mut job,
+                                        ui.style(),
+                                        FontSelection::Default,
+                                        egui::Align::Center,
+                                    );
 
-                                    let galley = ui.painter().layout_job(job);
+                                let galley = ui.painter().layout_job(job);
 
-                                    let rotation = Rot2::from_angle(PI / 2.0);
+                                let rotation = Rot2::from_angle(PI / 2.0);
 
-                                    let (rect, _) = {
-                                        let bounding_rect =
-                                            Rect::from_center_size(Pos2::ZERO, galley.size())
-                                                .rotate_bb(rotation);
-                                        ui.allocate_exact_size(bounding_rect.size(), Sense::empty())
-                                    };
+                                let (rect, _) = {
+                                    let bounding_rect =
+                                        Rect::from_center_size(Pos2::ZERO, galley.size())
+                                            .rotate_bb(rotation);
+                                    ui.allocate_exact_size(bounding_rect.size(), Sense::empty())
+                                };
 
-                                    if ui.is_rect_visible(rect) {
-                                        let pos =
-                                            rect.center() - (rotation * (galley.size() / 2.0));
+                                if ui.is_rect_visible(rect) {
+                                    let pos = rect.center() - (rotation * (galley.size() / 2.0));
 
-                                        ui.painter().add(TextShape {
-                                            angle: PI / 2.0,
-                                            ..TextShape::new(
-                                                pos,
-                                                galley,
-                                                egui::Color32::PLACEHOLDER,
-                                            )
-                                        });
-                                    }
-                                })
+                                    ui.painter().add(TextShape {
+                                        angle: PI / 2.0,
+                                        ..TextShape::new(pos, galley, egui::Color32::PLACEHOLDER)
+                                    });
+                                }
+                            });
                         });
+
+                        ui.with_layout(
+                            Layout::centered_and_justified(egui::Direction::TopDown)
+                                .with_main_justify(false)
+                                .with_main_align(egui::Align::Center),
+                            |ui| {
+                                for n in (0..31).filter(|i| river_status.used & (1 << i) != 0) {
+                                    ui.add(
+                                        egui::Button::new(format!("{n}"))
+                                            .corner_radius(5)
+                                            .fill(egui::Color32::from_gray(50)),
+                                    );
+                                }
+                            },
+                        );
+
+                        ui.with_layout(Layout::bottom_up(egui::Align::Center), |ui| {
+                            frame.show(ui, |ui| {
+                                ui.button("henlo :3");
+                            })
+                        })
                     });
             },
         );
@@ -1009,14 +1066,85 @@ impl SeatHandler for Taskbar {
 }
 
 impl PointerHandler for Taskbar {
+    #[allow(clippy::cast_possible_truncation)]
     fn pointer_frame(
         &mut self,
         _conn: &Connection,
         _qh: &wayland_client::QueueHandle<Self>,
         _pointer: &wayland_client::protocol::wl_pointer::WlPointer,
-        _events: &[smithay_client_toolkit::seat::pointer::PointerEvent],
+        events: &[smithay_client_toolkit::seat::pointer::PointerEvent],
     ) {
-        // TODO: Update EGui RawInput with pointer frame
+        let mut interacted = Vec::new();
+        self.input.lock().events.extend(events.iter().map(
+            |PointerEvent {
+                 surface,
+                 position: (x, y),
+                 kind,
+             }| {
+                interacted.push(surface.clone());
+                match kind {
+                    smithay_client_toolkit::seat::pointer::PointerEventKind::Leave {
+                        serial: _,
+                    } => egui::Event::PointerGone,
+                    smithay_client_toolkit::seat::pointer::PointerEventKind::Motion { time: _ }
+                    | smithay_client_toolkit::seat::pointer::PointerEventKind::Enter {
+                        serial: _,
+                    } => egui::Event::PointerMoved(Pos2::new(*x as f32, *y as f32)),
+                    smithay_client_toolkit::seat::pointer::PointerEventKind::Press {
+                        time: _,
+                        button,
+                        serial: _,
+                    } => egui::Event::PointerButton {
+                        pos:       Pos2::new(*x as f32, *y as f32),
+                        button:    match *button {
+                            BTN_LEFT => egui::PointerButton::Primary,
+                            BTN_RIGHT => egui::PointerButton::Secondary,
+                            BTN_MIDDLE => egui::PointerButton::Middle,
+                            BTN_SIDE => egui::PointerButton::Extra1,
+                            BTN_EXTRA => egui::PointerButton::Extra2,
+                            _ => unimplemented!(),
+                        },
+                        pressed:   true,
+                        modifiers: Modifiers::default(),
+                    },
+                    smithay_client_toolkit::seat::pointer::PointerEventKind::Release {
+                        time: _,
+                        button,
+                        serial: _,
+                    } => egui::Event::PointerButton {
+                        pos:       Pos2::new(*x as f32, *y as f32),
+                        button:    match *button {
+                            BTN_LEFT => egui::PointerButton::Primary,
+                            BTN_RIGHT => egui::PointerButton::Secondary,
+                            BTN_MIDDLE => egui::PointerButton::Middle,
+                            BTN_SIDE => egui::PointerButton::Extra1,
+                            BTN_EXTRA => egui::PointerButton::Extra2,
+                            _ => unimplemented!(),
+                        },
+                        pressed:   false,
+                        modifiers: Modifiers::default(),
+                    },
+                    smithay_client_toolkit::seat::pointer::PointerEventKind::Axis {
+                        time: _,
+                        horizontal,
+                        vertical,
+                        source: _,
+                    } => egui::Event::MouseWheel {
+                        unit:      egui::MouseWheelUnit::Point,
+                        delta:     Vec2::new(horizontal.absolute as f32, vertical.absolute as f32),
+                        modifiers: Modifiers::NONE,
+                    },
+                }
+            },
+        ));
+
+        interacted.dedup();
+        for id in interacted
+            .iter()
+            .filter_map(|surface| self.surfaces.get(surface))
+        {
+            self.context.request_repaint_of(*id);
+        }
     }
 }
 
