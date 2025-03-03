@@ -20,7 +20,7 @@ wayland-scanner = "*"
 wayland-client = "*"
 smol = "2.0"
 
-bytemuck = "1.21"
+bytemuck = "1.22"
 futures-lite = "2.6"
 
 [lints.clippy]

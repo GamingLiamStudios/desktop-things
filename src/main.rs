@@ -1,23 +1,10 @@
 #![allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
 use std::{
+    self,
     collections::HashMap,
     f32::consts::PI,
-    io::ErrorKind,
-    os::{
-        fd::{
-            AsFd,
-            AsRawFd,
-            FromRawFd,
-            RawFd,
-        },
-        unix::net::UnixStream,
-    },
     ptr::NonNull,
-    sync::{
-        mpsc::channel,
-        Arc,
-    },
-    task,
+    sync::Arc,
     time::Duration,
 };
 
@@ -29,14 +16,13 @@ use egui::{
         LayoutJob,
         TextWrapping,
     },
-    Color32,
     CornerRadius,
     FontSelection,
+    Frame,
     FullOutput,
     Layout,
     Margin,
     Modifiers,
-    PointerButton,
     Pos2,
     RawInput,
     Rect,
@@ -64,7 +50,16 @@ use egui_wgpu::{
     ScreenDescriptor,
     SurfaceErrorAction,
 };
-use futures_lite::FutureExt;
+use river_control_unstable_v1::{
+    zriver_command_callback_v1::{
+        self,
+        ZriverCommandCallbackV1,
+    },
+    zriver_control_v1::{
+        self,
+        ZriverControlV1,
+    },
+};
 use river_status_unstable_v1::{
     zriver_output_status_v1::{
         self,
@@ -143,11 +138,7 @@ use smithay_client_toolkit::{
         WaylandSurface,
     },
 };
-use smol::{
-    Async,
-    Executor,
-    LocalExecutor,
-};
+use smol::Executor;
 use tracing::{
     debug,
     info,
@@ -161,7 +152,6 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
     Layer,
 };
-use wayland_backend::client::WaylandError;
 use wayland_client::{
     protocol::{
         wl_output::WlOutput,
@@ -226,12 +216,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (globals, mut event_queue) = registry_queue_init(&wayland_conn)?;
     let qh = event_queue.handle();
 
-    // Before we can use river status thing, we need to know the current output
-    // however that looks to be very annoying, and honestly the best way looks to
-    // be simply just letting a different taskbar be rendered per screen attached.
-    // Then we can simply just manually specify the output for the bar and all's
-    // good with the world.
-
     smol::block_on(async {
         let setup = egui_wgpu::WgpuSetupCreateNew {
             power_preference: egui_wgpu::wgpu::PowerPreference::LowPower,
@@ -267,7 +251,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             river_status: globals.bind(&qh, 4..=4, GlobalData)?,
             river_outputs: HashMap::new(),
-            river_focus: HashMap::new(),
+            river_focus: Arc::new(Mutex::new(HashMap::new())),
+
+            river_control: globals.bind(&qh, 1..=1, GlobalData)?,
 
             context: context.clone(),
             input: input.clone(),
@@ -295,6 +281,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let viewports = viewports.clone();
                 let render_state = render_state.clone();
                 let wgpu_config = wgpu_config.clone();
+                let qh = qh.clone();
 
                 exec.spawn(async move {
                     smol::Timer::after(delay).await;
@@ -436,6 +423,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .queue
                             .submit(buffer_commands.into_iter().chain([encoder.finish()]));
                         surface_texture.present();
+
+                        viewport
+                            .layer
+                            .wl_surface()
+                            .frame(&qh, viewport.layer.wl_surface().clone());
+                        viewport.layer.wl_surface().commit();
                     }
 
                     {
@@ -520,9 +513,10 @@ struct Taskbar {
     layers:     LayerShell,
     fractional: WpFractionalScaleManagerV1,
 
+    river_control: ZriverControlV1,
     river_status:  ZriverStatusManagerV1,
     river_outputs: HashMap<WlOutput, Arc<Mutex<RiverOutputStatus>>>,
-    river_focus:   HashMap<WlSeat, WlOutput>,
+    river_focus:   Arc<Mutex<HashMap<WlSeat, WlOutput>>>,
 
     registry: RegistryState,
     seat:     SeatState,
@@ -648,15 +642,15 @@ impl Dispatch<ZriverSeatStatusV1, WlSeat> for Taskbar {
     ) {
         match event {
             zriver_seat_status_v1::Event::FocusedOutput { output } => {
-                state.river_focus.insert(seat.clone(), output);
+                state.river_focus.lock().insert(seat.clone(), output);
             },
             zriver_seat_status_v1::Event::UnfocusedOutput { output: _ } => {
                 // Assuming seat cannot focus more than one output (for convenience sake)
-                state.river_focus.remove(seat);
+                state.river_focus.lock().remove(seat);
             },
             zriver_seat_status_v1::Event::FocusedView { title } => {
-                let focused = state
-                    .river_focus
+                let river_focus = state.river_focus.lock();
+                let focused = river_focus
                     .get(seat)
                     .expect("Seat not attached to Output focused on View");
 
@@ -678,6 +672,37 @@ impl Dispatch<ZriverSeatStatusV1, WlSeat> for Taskbar {
             zriver_seat_status_v1::Event::Mode { name: _ } => {
                 // Unused
             },
+        }
+    }
+}
+
+impl Dispatch<ZriverControlV1, GlobalData> for Taskbar {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZriverControlV1,
+        _event: zriver_control_v1::Event,
+        _data: &GlobalData,
+        _conn: &Connection,
+        _qhandle: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+    ) {
+        unimplemented!("There are no events for RiverControlV1")
+    }
+}
+
+impl Dispatch<ZriverCommandCallbackV1, GlobalData> for Taskbar {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZriverCommandCallbackV1,
+        event: zriver_command_callback_v1::Event,
+        _data: &GlobalData,
+        _conn: &Connection,
+        _qhandle: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+    ) {
+        match event {
+            zriver_command_callback_v1::Event::Failure { failure_message } => {
+                warn!(failure_message);
+            },
+            zriver_command_callback_v1::Event::Success { output: _ } => {},
         }
     }
 }
@@ -789,9 +814,9 @@ impl CompositorHandler for Taskbar {
         time: u32,
     ) {
         self.input.lock().time = Some(Duration::from_millis(u64::from(time)).as_secs_f64());
-        if let Some(&id) = self.surfaces.get(surface) {
-            self.context.request_repaint_of(id);
-        }
+        // if let Some(&id) = self.surfaces.get(surface) {
+        //     self.context.request_repaint_of(id);
+        // }
     }
 
     fn surface_enter(
@@ -885,7 +910,12 @@ impl OutputHandler for Taskbar {
             view_title: String::new(),
         }));
 
-        self.river_outputs.insert(output, river_status.clone());
+        self.river_outputs
+            .insert(output.clone(), river_status.clone());
+
+        let river_control = self.river_control.clone();
+        let qh = qh.clone();
+        let river_focus = self.river_focus.clone();
 
         // TODO: Move this ui func somewhere else
         self.context.show_viewport_deferred(
@@ -900,81 +930,168 @@ impl OutputHandler for Taskbar {
                     .corner_radius(CornerRadius::same(10))
                     .fill(egui::Color32::from_gray(50));
 
-                egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::new()
-                            .inner_margin(Margin::symmetric(2, 0))
-                            .corner_radius(CornerRadius::same(10))
-                            .fill(egui::Color32::from_gray(0xaa).gamma_multiply(0.3)),
-                    )
-                    .show(ctx, |ui| {
-                        let river_status = river_status.lock();
+                let render_ui = |ui: &mut egui::Ui, sizes: Option<Vec<Rect>>| {
+                    let river_status = river_status.lock();
+                    let focused = (0..31).filter(|i| river_status.used & (1 << i) != 0);
 
-                        let total_vertical = ui.available_height();
+                    ui.style_mut().visuals.panel_fill = egui::Color32::from_gray(50);
+                    ui.style_mut().visuals.window_fill = egui::Color32::from_gray(50);
+                    ui.style_mut().visuals.override_text_color = Some(egui::Color32::WHITE);
 
-                        ui.vertical_centered(|ui| {
-                            frame.show(ui, |ui| {
-                                let mut job = LayoutJob {
-                                    wrap: TextWrapping::from_wrap_mode_and_width(
-                                        egui::TextWrapMode::Truncate,
-                                        ui.available_height() / 3.0,
-                                    ),
-                                    ..Default::default()
-                                };
-                                RichText::new(river_status.view_title.as_str())
-                                    .size(16.0)
-                                    .strong()
-                                    .color(Color32::WHITE)
-                                    .append_to(
-                                        &mut job,
-                                        ui.style(),
-                                        FontSelection::Default,
-                                        egui::Align::Center,
+                    let mut sizes = vec![];
+                    egui::Frame::new()
+                        .inner_margin(Margin::symmetric(2, 0))
+                        .corner_radius(CornerRadius::same(10))
+                        .fill(egui::Color32::from_gray(0xaa).gamma_multiply(0.3))
+                        .show(ui, |ui| {
+                            ui.with_layout(
+                                egui::Layout::top_down(egui::Align::Center)
+                                    .with_cross_justify(true),
+                                |ui| {
+                                    sizes.push(
+                                        frame
+                                            .inner_margin(8)
+                                            .show(ui, |ui| {
+                                                let mut job = LayoutJob {
+                                                    wrap: TextWrapping::from_wrap_mode_and_width(
+                                                        egui::TextWrapMode::Truncate,
+                                                        ui.available_height() / 3.0,
+                                                    ),
+                                                    ..Default::default()
+                                                };
+                                                RichText::new(river_status.view_title.as_str())
+                                                    .size(16.0)
+                                                    .strong()
+                                                    .append_to(
+                                                        &mut job,
+                                                        ui.style(),
+                                                        FontSelection::Default,
+                                                        egui::Align::Center,
+                                                    );
+
+                                                let galley = ui.painter().layout_job(job);
+
+                                                let rotation = Rot2::from_angle(PI / 2.0);
+
+                                                let (rect, _) = {
+                                                    let bounding_rect = Rect::from_center_size(
+                                                        Pos2::ZERO,
+                                                        galley.size(),
+                                                    )
+                                                    .rotate_bb(rotation);
+                                                    ui.allocate_exact_size(
+                                                        bounding_rect.size(),
+                                                        Sense::empty(),
+                                                    )
+                                                };
+
+                                                if ui.is_rect_visible(rect) {
+                                                    let pos = rect.center()
+                                                        - (rotation * (galley.size() / 2.0));
+
+                                                    ui.painter().add(TextShape {
+                                                        angle: PI / 2.0,
+                                                        ..TextShape::new(
+                                                            pos,
+                                                            galley,
+                                                            egui::Color32::PLACEHOLDER,
+                                                        )
+                                                    });
+                                                }
+                                            })
+                                            .response
+                                            .rect,
                                     );
 
-                                let galley = ui.painter().layout_job(job);
+                                    sizes.push(
+                                        egui::Frame::NONE
+                                            .show(ui, |ui| {
+                                                ui.spacing_mut().item_spacing = Vec2::new(0.0, 1.0);
 
-                                let rotation = Rot2::from_angle(PI / 2.0);
+                                                for tag in focused {
+                                                    if ui
+                                                        .add(
+                                                            egui::Button::new(
+                                                                RichText::new(format!(
+                                                                    "{}",
+                                                                    tag + 1
+                                                                ))
+                                                                .size(16.0)
+                                                                .strong(),
+                                                            )
+                                                            .min_size(Vec2::new(
+                                                                ui.available_width(),
+                                                                ui.available_width() * 0.6,
+                                                            ))
+                                                            .corner_radius(5)
+                                                            .fill(egui::Color32::from_gray(50)),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        // Attempt find seat attached to
+                                                        // current
+                                                        // viewport (output)
+                                                        if let Some((seat, _)) = river_focus
+                                                            .lock()
+                                                            .iter()
+                                                            .find(|&(_, v)| *v == output)
+                                                        {
+                                                            river_control.add_argument(
+                                                                "set-focused-tags".to_string(),
+                                                            );
+                                                            river_control.add_argument(format!(
+                                                                "{}",
+                                                                1 << tag
+                                                            ));
+                                                            river_control
+                                                                .run_command(seat, &qh, GlobalData);
+                                                        }
+                                                    }
+                                                }
+                                            })
+                                            .response
+                                            .rect,
+                                    );
 
-                                let (rect, _) = {
-                                    let bounding_rect =
-                                        Rect::from_center_size(Pos2::ZERO, galley.size())
-                                            .rotate_bb(rotation);
-                                    ui.allocate_exact_size(bounding_rect.size(), Sense::empty())
-                                };
-
-                                if ui.is_rect_visible(rect) {
-                                    let pos = rect.center() - (rotation * (galley.size() / 2.0));
-
-                                    ui.painter().add(TextShape {
-                                        angle: PI / 2.0,
-                                        ..TextShape::new(pos, galley, egui::Color32::PLACEHOLDER)
-                                    });
-                                }
-                            });
+                                    sizes.push(
+                                        ui.scope(|ui| {
+                                            ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
+                                            ui.with_layout(
+                                                Layout::bottom_up(egui::Align::Center),
+                                                |ui| {
+                                                    frame.show(ui, |ui| ui.label("Time"));
+                                                    frame.show(ui, |ui| ui.label("Batt"));
+                                                    ui.separator();
+                                                    frame.show(ui, |ui| ui.label("Dock"));
+                                                },
+                                            )
+                                        })
+                                        .response
+                                        .rect,
+                                    );
+                                },
+                            )
                         });
 
-                        ui.with_layout(
-                            Layout::centered_and_justified(egui::Direction::TopDown)
-                                .with_main_justify(false)
-                                .with_main_align(egui::Align::Center),
-                            |ui| {
-                                for n in (0..31).filter(|i| river_status.used & (1 << i) != 0) {
-                                    ui.add(
-                                        egui::Button::new(format!("{n}"))
-                                            .corner_radius(5)
-                                            .fill(egui::Color32::from_gray(50)),
-                                    );
-                                }
-                            },
-                        );
+                    sizes.iter().map(egui::Rect::size).collect::<Vec<_>>()
+                };
 
-                        ui.with_layout(Layout::bottom_up(egui::Align::Center), |ui| {
-                            frame.show(ui, |ui| {
-                                ui.button("henlo :3");
-                            })
-                        })
-                    });
+                let _sizes = {
+                    let mut sizing_pass = egui::Ui::new(
+                        ctx.clone(),
+                        "Taskbar_SizingPass".into(),
+                        egui::UiBuilder::new()
+                            .sizing_pass()
+                            .layout(Layout::top_down(egui::Align::Max))
+                            .invisible(),
+                    );
+                    render_ui(&mut sizing_pass, None)
+                };
+                info!(?_sizes);
+
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| render_ui(ui, None));
             },
         );
     }
