@@ -59,6 +59,7 @@ use smithay_client_toolkit::{
     delegate_registry,
     delegate_seat,
     delegate_shm,
+    globals::GlobalData,
     output::{
         OutputHandler,
         OutputState,
@@ -77,6 +78,7 @@ use smithay_client_toolkit::{
         client::{
             ConnectError,
             Connection,
+            Dispatch,
             DispatchError,
             EventQueue,
             Proxy,
@@ -122,6 +124,16 @@ use smithay_client_toolkit::{
 };
 use tracing::debug;
 use wayland_backend::client::ObjectId;
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1::{
+        self,
+        WpFractionalScaleManagerV1,
+    },
+    wp_fractional_scale_v1::{
+        self,
+        WpFractionalScaleV1,
+    },
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -221,6 +233,7 @@ where
         registry_state: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &queue_handle),
         output_state: OutputState::new(&globals, &queue_handle),
+        fractional_manager: globals.bind(&queue_handle, 1..=1, GlobalData)?,
 
         compositor,
         layer_shell,
@@ -228,7 +241,7 @@ where
         instance,
         render_state,
 
-        outputs: BTreeMap::new(),
+        output_roots: HashMap::new(),
         surfaces: HashMap::new(),
 
         render_fn: Arc::new(render_fn),
@@ -248,11 +261,11 @@ where
 
             unsafe_loop_handle
                 .insert_source(timer, move |_event, (), ctx| {
-                    if let Some(layer) = ctx.outputs.get(&viewport_id) {
-                        layer
-                            .wl_surface()
-                            .frame(&queue_handle, layer.wl_surface().clone());
-                        layer.wl_surface().commit();
+                    if let Some(layer) =
+                        ctx.surfaces.values().find(|v| v.viewport_id == viewport_id)
+                    {
+                        layer.wayland.frame(&queue_handle, layer.wayland.clone());
+                        layer.wayland.commit();
                     }
 
                     TimeoutAction::Drop
@@ -272,49 +285,57 @@ struct Window {
     seat_state:     SeatState,
     output_state:   OutputState,
 
+    fractional_manager: WpFractionalScaleManagerV1,
+
     compositor:  CompositorState,
     layer_shell: LayerShell,
 
     instance:     wgpu::Instance,
     render_state: RenderState,
 
-    outputs:  BTreeMap<ViewportId, LayerSurface>,
-    surfaces: HashMap<ObjectId, wgpu::Surface<'static>>,
+    surfaces:     HashMap<ObjectId, Surface>,
+    output_roots: HashMap<ObjectId, LayerSurface>,
 
     egui_context: egui::Context,
     egui_input:   egui::RawInput,
     render_fn:    Arc<dyn Fn(&egui::Context) + Send + Sync + 'static>,
 }
 
+struct Surface {
+    viewport_id: ViewportId,
+
+    wayland: WlSurface,
+    wgpu:    wgpu::Surface<'static>,
+
+    fractional: WpFractionalScaleV1,
+}
+
 impl Window {
     fn draw(
         &mut self,
         surface: &WlSurface,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
     ) {
-        debug!(id = ?surface.id(), "Frame!");
         let mut input = self.egui_input.take();
 
-        let viewport = ViewportId::from_hash_of(surface.id());
-        input.viewport_id = viewport;
+        let Some(viewport) = self.surfaces.get(&surface.id()).map(|s| s.viewport_id) else {
+            return;
+        };
         let Some(callback) = self
             .egui_context
-            .viewport_for(input.viewport_id, |viewport| {
-                viewport.viewport_ui_cb.clone()
-            })
+            .viewport_for(viewport, |viewport| viewport.viewport_ui_cb.clone())
         else {
             return;
         };
+
+        input.viewport_id = viewport;
         let output = self.egui_context.run(input, callback.as_ref());
 
-        let prims = self
-            .egui_context
-            .tessellate(output.shapes, output.pixels_per_point);
-
-        let wgpu_surface = self
+        let wgpu_surface = &self
             .surfaces
             .get(&surface.id())
-            .expect("Surface not configured before WlSurface::frame");
+            .expect("Surface not configured before WlSurface::frame")
+            .wgpu;
         let surface_texture = wgpu_surface
             .get_current_texture()
             .expect("failed to acquire next swapchain texture");
@@ -322,6 +343,7 @@ impl Window {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        // FIXME: Get scaling factor properly
         let screen_descriptor = ScreenDescriptor {
             size_in_pixels:   [
                 surface_texture.texture.width(),
@@ -329,6 +351,10 @@ impl Window {
             ],
             pixels_per_point: output.pixels_per_point,
         };
+
+        let prims = self
+            .egui_context
+            .tessellate(output.shapes, screen_descriptor.pixels_per_point);
 
         let mut encoder =
             self.render_state
@@ -378,8 +404,6 @@ impl Window {
                 .forget_lifetime();
 
             let state = self.render_state.renderer.read();
-
-            // FIXME: Get scaling factor properly
             state.render(&mut render_pass, &prims, &screen_descriptor);
         }
 
@@ -400,7 +424,6 @@ impl Window {
 
         if !output.viewport_output.contains_key(&viewport) {
             self.surfaces.remove(&surface.id());
-            self.outputs.remove(&viewport);
         }
     }
 }
@@ -409,11 +432,21 @@ impl CompositorHandler for Window {
     fn scale_factor_changed(
         &mut self,
         _conn: &Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
-        _new_factor: i32,
+        _qh: &QueueHandle<Self>,
+        surface: &WlSurface,
+        new_factor: i32,
     ) {
-        // TODO
+        let Some(viewport) = self
+            .egui_input
+            .viewports
+            .get_mut(&ViewportId::from_hash_of(surface.id()))
+        else {
+            return;
+        };
+
+        #[allow(clippy::cast_precision_loss)]
+        let scale = new_factor as f32 / 120.0;
+        viewport.native_pixels_per_point = Some(scale);
     }
 
     fn transform_changed(
@@ -431,8 +464,9 @@ impl CompositorHandler for Window {
         _conn: &Connection,
         qh: &QueueHandle<Self>,
         surface: &WlSurface,
-        _time: u32,
+        time: u32,
     ) {
+        self.egui_input.time = Some(f64::from(time));
         self.draw(surface, qh);
     }
 
@@ -482,8 +516,7 @@ impl OutputHandler for Window {
         layer.commit();
 
         debug!(id = ?output.id(), surface = ?layer.wl_surface().id(), "New Output");
-        self.outputs
-            .insert(ViewportId::from_hash_of(layer.wl_surface().id()), layer);
+        self.output_roots.insert(output.id(), layer);
     }
 
     fn update_output(
@@ -502,7 +535,14 @@ impl OutputHandler for Window {
         _qh: &QueueHandle<Self>,
         output: WlOutput,
     ) {
-        _ = self.outputs.remove(&ViewportId::from_hash_of(output.id()));
+        let Some(layer) = self.output_roots.remove(&output.id()) else {
+            return;
+        };
+
+        self.egui_context.send_viewport_cmd_to(
+            ViewportId::from_hash_of(layer.wl_surface().id()),
+            ViewportCommand::Close,
+        );
     }
 }
 impl SeatHandler for Window {
@@ -670,19 +710,33 @@ impl LayerShellHandler for Window {
                     NonNull::new(layer.wl_surface().id().as_ptr().cast())
                         .expect("Wayland provided nullptr"),
                 ));
-                unsafe {
+                let surface = unsafe {
                     self.instance
                         .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
                             raw_display_handle: display_handle,
                             raw_window_handle:  surface_handle,
                         })
                 }
-                .expect("Failed to create Wgpu Surface")
+                .expect("Failed to create Wgpu Surface");
+
+                let fractional = self.fractional_manager.get_fractional_scale(
+                    layer.wl_surface(),
+                    qh,
+                    layer.wl_surface().clone(),
+                );
+
+                Surface {
+                    viewport_id: ViewportId::from_hash_of(layer.wl_surface().id()),
+                    wayland: layer.wl_surface().clone(),
+                    wgpu: surface,
+
+                    fractional,
+                }
             });
 
         let (width, height) = configure.new_size;
 
-        let cap = surface.get_capabilities(&self.render_state.adapter);
+        let cap = surface.wgpu.get_capabilities(&self.render_state.adapter);
         let prefrered_format = egui_wgpu::preferred_framebuffer_format(&cap.formats)
             .expect("No supported Framebuffer format");
 
@@ -698,7 +752,9 @@ impl LayerShellHandler for Window {
             present_mode: wgpu::PresentMode::Mailbox,
         };
 
-        surface.configure(&self.render_state.device, &surface_config);
+        surface
+            .wgpu
+            .configure(&self.render_state.device, &surface_config);
 
         // Request frame redraw
         //layer.wl_surface().damage(0, 0, width as i32, height as i32);
@@ -706,20 +762,19 @@ impl LayerShellHandler for Window {
         layer.wl_surface().commit();
 
         let render_fn = self.render_fn.clone();
-        let viewport = ViewportId::from_hash_of(layer.wl_surface().id());
         self.egui_context.show_viewport_deferred(
-            viewport,
+            surface.viewport_id,
             ViewportBuilder::default().with_transparent(true),
             move |ctx, _class| (render_fn)(ctx),
         );
-        self.egui_context.request_repaint_of(viewport);
+        self.egui_context.request_repaint_of(surface.viewport_id);
 
         _ = self
             .egui_input
             .viewports
-            .entry(viewport)
+            .entry(surface.viewport_id)
             .or_insert_with(|| ViewportInfo {
-                parent: None,
+                parent: Some(ViewportId::ROOT),
                 ..Default::default()
             });
 
@@ -728,6 +783,47 @@ impl LayerShellHandler for Window {
         }
 
         debug!(id = ?layer.wl_surface().id(), width, height, "Configured");
+    }
+}
+
+impl Dispatch<WpFractionalScaleManagerV1, GlobalData> for Window {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpFractionalScaleManagerV1,
+        _event: wp_fractional_scale_manager_v1::Event,
+        _data: &GlobalData,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        unreachable!()
+    }
+}
+
+impl Dispatch<WpFractionalScaleV1, WlSurface> for Window {
+    fn event(
+        state: &mut Self,
+        _proxy: &WpFractionalScaleV1,
+        event: wp_fractional_scale_v1::Event,
+        data: &WlSurface,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wp_fractional_scale_v1::Event::PreferredScale { scale } => {
+                let Some(viewport) = state
+                    .egui_input
+                    .viewports
+                    .get_mut(&ViewportId::from_hash_of(data.id()))
+                else {
+                    return;
+                };
+
+                #[allow(clippy::cast_precision_loss)]
+                let scale = scale as f32 / 120.0;
+                viewport.native_pixels_per_point = Some(scale);
+            },
+            _ => unreachable!(),
+        }
     }
 }
 

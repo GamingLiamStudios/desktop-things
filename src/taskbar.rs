@@ -1,5 +1,4 @@
 use desktop_things::layershell;
-use egui::ViewportBuilder;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fmt_subscriber = tracing_subscriber::fmt::Subscriber::builder()
@@ -12,11 +11,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn ui(ctx: &egui::Context) {
-    egui::CentralPanel::default()
-        .frame(egui::Frame::new())
-        .show(ctx, |ui| {
-            ui.add(egui::Label::new("Test"));
-        });
+    let frame = egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(0, 4))
+        .outer_margin(egui::Margin::symmetric(2, 2))
+        .corner_radius(egui::CornerRadius::same(10))
+        .fill(egui::Color32::from_gray(50));
+
+    egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+        ui.add(egui::Label::new("Test"));
+    });
 
     ctx.request_repaint_after_secs(1.0);
 }

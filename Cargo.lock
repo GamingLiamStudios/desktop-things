@@ -253,6 +253,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wayland-backend",
+ "wayland-protocols",
  "wayland-scanner",
 ]
 
