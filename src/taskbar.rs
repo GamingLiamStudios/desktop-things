@@ -1,8 +1,9 @@
 use desktop_things::layershell;
+use tracing::debug;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fmt_subscriber = tracing_subscriber::fmt::Subscriber::builder()
-        .with_max_level(tracing::Level::TRACE)
+        .with_max_level(tracing::Level::DEBUG)
         .finish();
     tracing::subscriber::set_global_default(fmt_subscriber)?;
 
@@ -19,7 +20,8 @@ fn ui(ctx: &egui::Context) {
 
     egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
         ui.add(egui::Label::new("Test"));
-    });
 
-    ctx.request_repaint_after_secs(1.0);
+        let is_clicked = ui.add(egui::Button::new("atoms")).clicked();
+        debug!(is_clicked);
+    });
 }

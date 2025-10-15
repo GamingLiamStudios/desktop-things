@@ -31,7 +31,7 @@ wayland-backend = { version = "*", features = ["client_system"] }
 pollster = "0.4"
 
 egui = "0.33"
-egui-wgpu = "*"
+egui-wgpu = "0.33"
 
 
 [lints.clippy]

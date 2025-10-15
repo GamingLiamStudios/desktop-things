@@ -3,6 +3,7 @@ use std::{
         BTreeMap,
         HashMap,
     },
+    hash::Hash,
     ops::Deref,
     ptr::NonNull,
     sync::{
@@ -89,7 +90,12 @@ use smithay_client_toolkit::{
                 registry_queue_init,
             },
             protocol::{
-                wl_output::WlOutput,
+                wl_output::{
+                    Transform,
+                    WlOutput,
+                },
+                wl_pointer::WlPointer,
+                wl_seat::WlSeat,
                 wl_surface::WlSurface,
             },
         },
@@ -100,10 +106,15 @@ use smithay_client_toolkit::{
     },
     registry_handlers,
     seat::{
+        Capability,
         SeatHandler,
         SeatState,
         keyboard::KeyboardHandler,
-        pointer::PointerHandler,
+        pointer::{
+            PointerEvent,
+            PointerEventKind,
+            PointerHandler,
+        },
     },
     shell::{
         WaylandSurface,
@@ -235,6 +246,8 @@ where
         output_state: OutputState::new(&globals, &queue_handle),
         fractional_manager: globals.bind(&queue_handle, 1..=1, GlobalData)?,
 
+        pointers: HashMap::new(),
+
         compositor,
         layer_shell,
 
@@ -287,6 +300,8 @@ struct Window {
 
     fractional_manager: WpFractionalScaleManagerV1,
 
+    pointers: HashMap<WlSeat, WlPointer>,
+
     compositor:  CompositorState,
     layer_shell: LayerShell,
 
@@ -311,6 +326,7 @@ struct Surface {
 }
 
 impl Window {
+    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
     fn draw(
         &mut self,
         surface: &WlSurface,
@@ -328,9 +344,6 @@ impl Window {
             return;
         };
 
-        input.viewport_id = viewport;
-        let output = self.egui_context.run(input, callback.as_ref());
-
         let wgpu_surface = &self
             .surfaces
             .get(&surface.id())
@@ -343,14 +356,32 @@ impl Window {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        // FIXME: Get scaling factor properly
         let screen_descriptor = ScreenDescriptor {
             size_in_pixels:   [
                 surface_texture.texture.width(),
                 surface_texture.texture.height(),
             ],
-            pixels_per_point: output.pixels_per_point,
+            pixels_per_point: input.viewport().native_pixels_per_point.unwrap_or(1.0)
+                * self.egui_context.zoom_factor(),
         };
+
+        input.screen_rect = (screen_descriptor.size_in_pixels[0] > 0
+            && screen_descriptor.size_in_pixels[1] > 0)
+            .then(|| {
+                egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(
+                        screen_descriptor.size_in_pixels[0] as f32
+                            / screen_descriptor.pixels_per_point,
+                        screen_descriptor.size_in_pixels[1] as f32
+                            / screen_descriptor.pixels_per_point,
+                    ),
+                )
+            });
+
+        debug!(events = ?input.events, ?viewport);
+        input.viewport_id = viewport;
+        let output = self.egui_context.run(input, callback.as_ref());
 
         let prims = self
             .egui_context
@@ -445,18 +476,17 @@ impl CompositorHandler for Window {
         };
 
         #[allow(clippy::cast_precision_loss)]
-        let scale = new_factor as f32 / 120.0;
+        let scale = new_factor as f32;
         viewport.native_pixels_per_point = Some(scale);
     }
 
     fn transform_changed(
         &mut self,
         _conn: &Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
-        _new_transform: smithay_client_toolkit::reexports::client::protocol::wl_output::Transform,
+        _qh: &QueueHandle<Self>,
+        _surface: &WlSurface,
+        _new_transform: Transform,
     ) {
-        // TODO
     }
 
     fn frame(
@@ -473,18 +503,18 @@ impl CompositorHandler for Window {
     fn surface_enter(
         &mut self,
         _conn: &Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
-        _output: &smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput,
+        _qh: &QueueHandle<Self>,
+        _surface: &WlSurface,
+        _output: &WlOutput,
     ) {
     }
 
     fn surface_leave(
         &mut self,
         _conn: &Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
-        _output: &smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput,
+        _qh: &QueueHandle<Self>,
+        _surface: &WlSurface,
+        _output: &WlOutput,
     ) {
     }
 }
@@ -553,39 +583,47 @@ impl SeatHandler for Window {
     fn new_seat(
         &mut self,
         _conn: &Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _seat: smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat,
+        _qh: &QueueHandle<Self>,
+        _seat: WlSeat,
     ) {
-        //todo!()
     }
 
     fn new_capability(
         &mut self,
         _conn: &Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _seat: smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat,
-        _capability: smithay_client_toolkit::seat::Capability,
+        qh: &QueueHandle<Self>,
+        seat: WlSeat,
+        capability: smithay_client_toolkit::seat::Capability,
     ) {
-        //todo!()
+        if capability == Capability::Pointer {
+            let pointer = self
+                .seat_state
+                .get_pointer(qh, &seat)
+                .expect("Failed to get WlSeat::Pointer");
+
+            self.pointers.insert(seat, pointer);
+        }
     }
 
     fn remove_capability(
         &mut self,
         _conn: &Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _seat: smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat,
-        _capability: smithay_client_toolkit::seat::Capability,
+        _qh: &QueueHandle<Self>,
+        seat: WlSeat,
+        capability: smithay_client_toolkit::seat::Capability,
     ) {
-        //todo!()
+        if capability == Capability::Pointer {
+            self.pointers.remove(&seat);
+        }
     }
 
     fn remove_seat(
         &mut self,
         _conn: &Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _seat: smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat,
+        _qh: &QueueHandle<Self>,
+        seat: WlSeat,
     ) {
-        //todo!()
+        self.pointers.remove(&seat);
     }
 }
 
@@ -661,18 +699,98 @@ impl KeyboardHandler for Window {
         todo!()
     }
 }
-impl PointerHandler for Window {
-    fn pointer_frame(
-        &mut self,
-        conn: &Connection,
-        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        pointer: &smithay_client_toolkit::reexports::client::protocol::wl_pointer::WlPointer,
-        events: &[smithay_client_toolkit::seat::pointer::PointerEvent],
-    ) {
-        todo!()
+*/
+
+const fn from_raw_button(code: u32) -> egui::PointerButton {
+    use smithay_client_toolkit::seat::pointer::{
+        BTN_BACK,
+        BTN_FORWARD,
+        BTN_MIDDLE,
+        BTN_RIGHT,
+    };
+
+    match code {
+        BTN_RIGHT => egui::PointerButton::Secondary,
+        BTN_MIDDLE => egui::PointerButton::Middle,
+        BTN_BACK => egui::PointerButton::Extra1,
+        BTN_FORWARD => egui::PointerButton::Extra2,
+        _ => egui::PointerButton::Primary,
     }
 }
-*/
+
+impl PointerHandler for Window {
+    #[allow(clippy::cast_possible_truncation)]
+    fn pointer_frame(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _pointer: &WlPointer,
+        events: &[PointerEvent],
+    ) {
+        for PointerEvent {
+            surface,
+            position: (pos_x, pos_y),
+            kind,
+        } in events
+        {
+            let event = match kind {
+                PointerEventKind::Enter { serial: _ } | PointerEventKind::Motion { time: _ } => {
+                    egui::Event::PointerMoved(egui::Pos2 {
+                        x: *pos_x as f32,
+                        y: *pos_y as f32,
+                    })
+                },
+                PointerEventKind::Axis {
+                    time: _,
+                    horizontal,
+                    vertical,
+                    source: _,
+                } => egui::Event::MouseWheel {
+                    unit:      egui::MouseWheelUnit::Point,
+                    delta:     egui::Vec2 {
+                        x: horizontal.absolute as f32,
+                        y: vertical.absolute as f32,
+                    },
+                    modifiers: egui::Modifiers::default(), // FIXME: Modifiers
+                },
+                PointerEventKind::Press {
+                    time: _,
+                    button,
+                    serial: _,
+                } => egui::Event::PointerButton {
+                    pos:       egui::Pos2 {
+                        x: *pos_x as f32,
+                        y: *pos_y as f32,
+                    },
+                    button:    from_raw_button(*button),
+                    pressed:   true,
+                    modifiers: egui::Modifiers::default(), // FIXME: Modifiers
+                },
+                PointerEventKind::Release {
+                    time: _,
+                    button,
+                    serial: _,
+                } => egui::Event::PointerButton {
+                    pos:       egui::Pos2 {
+                        x: *pos_x as f32,
+                        y: *pos_y as f32,
+                    },
+                    button:    from_raw_button(*button),
+                    pressed:   false,
+                    modifiers: egui::Modifiers::default(), // FIXME: Modifiers
+                },
+                PointerEventKind::Leave { serial: _ } => egui::Event::PointerGone,
+            };
+
+            self.egui_input.events.push(event);
+
+            if let Some(surface) = self.surfaces.get(&surface.id()) {
+                let viewport = surface.viewport_id;
+                self.egui_context.request_repaint_of(viewport);
+            }
+        }
+    }
+}
 
 impl LayerShellHandler for Window {
     fn closed(
@@ -832,7 +950,7 @@ delegate_output!(Window);
 
 delegate_seat!(Window);
 //delegate_keyboard!(Window);
-//delegate_pointer!(Window);
+delegate_pointer!(Window);
 
 delegate_layer!(Window);
 
