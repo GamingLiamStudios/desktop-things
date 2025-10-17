@@ -133,7 +133,10 @@ use smithay_client_toolkit::{
         ShmHandler,
     },
 };
-use tracing::debug;
+use tracing::{
+    debug,
+    warn,
+};
 use wayland_backend::client::ObjectId;
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1::{
@@ -322,7 +325,7 @@ struct Surface {
     wayland: WlSurface,
     wgpu:    wgpu::Surface<'static>,
 
-    fractional: WpFractionalScaleV1,
+    _fractional: WpFractionalScaleV1,
 }
 
 impl Window {
@@ -335,12 +338,14 @@ impl Window {
         let mut input = self.egui_input.take();
 
         let Some(viewport) = self.surfaces.get(&surface.id()).map(|s| s.viewport_id) else {
+            warn!("Viewport doesn't exist for surface");
             return;
         };
         let Some(callback) = self
             .egui_context
             .viewport_for(viewport, |viewport| viewport.viewport_ui_cb.clone())
         else {
+            warn!("Immediate Callback");
             return;
         };
 
@@ -379,7 +384,7 @@ impl Window {
                 )
             });
 
-        debug!(events = ?input.events, ?viewport);
+        //debug!(events = ?input.events, ?viewport, time = ?input.time);
         input.viewport_id = viewport;
         let output = self.egui_context.run(input, callback.as_ref());
 
@@ -496,7 +501,8 @@ impl CompositorHandler for Window {
         surface: &WlSurface,
         time: u32,
     ) {
-        self.egui_input.time = Some(f64::from(time));
+        let time = Duration::from_millis(u64::from(time)).as_secs_f64();
+        self.egui_input.time = Some(time);
         self.draw(surface, qh);
     }
 
@@ -733,12 +739,25 @@ impl PointerHandler for Window {
             kind,
         } in events
         {
+            let pos = if let Some(surface) = self.surfaces.get(&surface.id()) {
+                let viewport = surface.viewport_id;
+                let info = self
+                    .egui_input
+                    .viewports
+                    .get(&viewport)
+                    .expect("Egui doesn't contain viewport");
+
+                let pixel_scale = (info.native_pixels_per_point.unwrap_or(1.0)
+                    * self.egui_context.zoom_factor())
+                .recip();
+                egui::pos2(*pos_x as f32 * pixel_scale, *pos_y as f32 * pixel_scale)
+            } else {
+                egui::pos2(*pos_x as f32, *pos_y as f32)
+            };
+
             let event = match kind {
                 PointerEventKind::Enter { serial: _ } | PointerEventKind::Motion { time: _ } => {
-                    egui::Event::PointerMoved(egui::Pos2 {
-                        x: *pos_x as f32,
-                        y: *pos_y as f32,
-                    })
+                    egui::Event::PointerMoved(pos)
                 },
                 PointerEventKind::Axis {
                     time: _,
@@ -758,12 +777,9 @@ impl PointerHandler for Window {
                     button,
                     serial: _,
                 } => egui::Event::PointerButton {
-                    pos:       egui::Pos2 {
-                        x: *pos_x as f32,
-                        y: *pos_y as f32,
-                    },
-                    button:    from_raw_button(*button),
-                    pressed:   true,
+                    pos,
+                    button: from_raw_button(*button),
+                    pressed: true,
                     modifiers: egui::Modifiers::default(), // FIXME: Modifiers
                 },
                 PointerEventKind::Release {
@@ -771,12 +787,9 @@ impl PointerHandler for Window {
                     button,
                     serial: _,
                 } => egui::Event::PointerButton {
-                    pos:       egui::Pos2 {
-                        x: *pos_x as f32,
-                        y: *pos_y as f32,
-                    },
-                    button:    from_raw_button(*button),
-                    pressed:   false,
+                    pos,
+                    button: from_raw_button(*button),
+                    pressed: false,
                     modifiers: egui::Modifiers::default(), // FIXME: Modifiers
                 },
                 PointerEventKind::Leave { serial: _ } => egui::Event::PointerGone,
@@ -845,10 +858,10 @@ impl LayerShellHandler for Window {
 
                 Surface {
                     viewport_id: ViewportId::from_hash_of(layer.wl_surface().id()),
-                    wayland: layer.wl_surface().clone(),
-                    wgpu: surface,
+                    wayland:     layer.wl_surface().clone(),
+                    wgpu:        surface,
 
-                    fractional,
+                    _fractional: fractional,
                 }
             });
 
@@ -882,7 +895,9 @@ impl LayerShellHandler for Window {
         let render_fn = self.render_fn.clone();
         self.egui_context.show_viewport_deferred(
             surface.viewport_id,
-            ViewportBuilder::default().with_transparent(true),
+            ViewportBuilder::default()
+                .with_transparent(true)
+                .with_decorations(false),
             move |ctx, _class| (render_fn)(ctx),
         );
         self.egui_context.request_repaint_of(surface.viewport_id);

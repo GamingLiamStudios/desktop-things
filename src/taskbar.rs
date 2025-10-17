@@ -16,12 +16,13 @@ fn ui(ctx: &egui::Context) {
         .inner_margin(egui::Margin::symmetric(0, 4))
         .outer_margin(egui::Margin::symmetric(2, 2))
         .corner_radius(egui::CornerRadius::same(10))
-        .fill(egui::Color32::from_gray(50));
+        .fill(egui::Color32::TRANSPARENT.blend(egui::Color32::from_gray(50)));
 
     egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
         ui.add(egui::Label::new("Test"));
 
-        let is_clicked = ui.add(egui::Button::new("atoms")).clicked();
-        debug!(is_clicked);
+        if ui.add(egui::Button::new("atoms")).clicked() {
+            debug!("WHAT");
+        }
     });
 }
