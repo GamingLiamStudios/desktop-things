@@ -16,7 +16,7 @@ fn ui(ctx: &egui::Context) {
         .inner_margin(egui::Margin::symmetric(0, 4))
         .outer_margin(egui::Margin::symmetric(2, 2))
         .corner_radius(egui::CornerRadius::same(10))
-        .fill(egui::Color32::TRANSPARENT.blend(egui::Color32::from_gray(50)));
+        .fill(egui::Rgba::from_white_alpha(0.2).into());
 
     egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
         ui.add(egui::Label::new("Test"));
