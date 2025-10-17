@@ -242,7 +242,7 @@ struct App {
 struct Display {
     _instance:    wgpu::Instance,
     render_state: RenderState,
-    _layer_root:  LayerSurface,
+    layer_root:   LayerSurface,
 
     egui_context: egui::Context,
     egui_input:   egui::RawInput,
@@ -333,7 +333,7 @@ impl App {
         Display {
             _instance: instance,
             render_state,
-            _layer_root: layer,
+            layer_root: layer,
 
             scale: 1.0,
             surfaces,
@@ -483,10 +483,23 @@ impl Display {
         // surface.frame(qh, surface.clone());
         // surface.commit();
 
-        // FIXME: Destroy unused surfaces
-        //if !output.viewport_output.contains_key(&viewport_id) {
-        //    app.surfaces.remove(surface);
-        //}
+        let mut to_remove = Vec::new();
+        for surface in self.surfaces.keys() {
+            if !output
+                .viewport_output
+                .contains_key(&ViewportId::from_hash_of(surface.id()))
+                && surface != self.layer_root.wl_surface()
+            {
+                to_remove.push(surface.clone());
+            }
+        }
+
+        for surface in to_remove {
+            self.surfaces.remove(&surface);
+            self.egui_input
+                .viewports
+                .remove(&ViewportId::from_hash_of(surface.id()));
+        }
     }
 }
 
@@ -536,7 +549,8 @@ impl CompositorHandler for App {
             return;
         };
 
-        let Some(display) = self.displays.get_mut(&surface.output) else {
+        let output = surface.output.clone();
+        let Some(display) = self.displays.get_mut(&output) else {
             warn!("Unassigned WlSurface");
             return;
         };
@@ -548,6 +562,15 @@ impl CompositorHandler for App {
 
         display.egui_input.time = Some(time);
         display.draw(viewport_id, &surface.wayland);
+
+        self.surfaces.retain(|_, surface| {
+            surface.output != output
+                || display
+                    .egui_input
+                    .viewports
+                    .contains_key(&ViewportId::from_hash_of(surface.wayland.id()))
+                || *display.layer_root.wl_surface() == surface.wayland
+        });
     }
 
     fn surface_enter(
@@ -863,13 +886,22 @@ impl LayerShellHandler for App {
         _qh: &QueueHandle<Self>,
         layer: &LayerSurface,
     ) {
-        let Some(surface) = self.surfaces.get(layer.wl_surface()) else {
-            warn!("Unregistered WlSurface");
-            return;
+        let output = {
+            let Some(surface) = self.surfaces.get(layer.wl_surface()) else {
+                warn!("Unregistered WlSurface");
+                return;
+            };
+
+            let output = surface.output.clone();
+            if let Some(display) = self.displays.get(&output) {
+                self.surfaces
+                    .retain(|id, _| !display.surfaces.contains_key(id));
+            }
+
+            output
         };
 
-        // FIXME: Close all popup windows
-        self.displays.remove(&surface.output);
+        self.displays.remove(&output);
     }
 
     fn configure(
