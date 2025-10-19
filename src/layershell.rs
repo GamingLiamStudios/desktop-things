@@ -6,31 +6,11 @@ use std::{
     time::Duration,
 };
 
-use egui::{
-    RequestRepaintInfo,
-    ViewportId,
-};
-use egui_wgpu::{
-    RenderState,
-    RendererOptions,
-    ScreenDescriptor,
-    WgpuConfiguration,
-    WgpuError,
-    WgpuSetupCreateNew,
-    wgpu::{
-        self,
-        Color,
-        InstanceDescriptor,
-        Operations,
-        RenderPassColorAttachment,
-        rwh::{
-            RawDisplayHandle,
-            RawWindowHandle,
-            WaylandDisplayHandle,
-            WaylandWindowHandle,
-        },
-        wgt::CommandEncoderDescriptor,
-    },
+use raw_window_handle::{
+    RawDisplayHandle,
+    RawWindowHandle,
+    WaylandDisplayHandle,
+    WaylandWindowHandle,
 };
 use smithay_client_toolkit::{
     compositor::{
@@ -70,6 +50,7 @@ use smithay_client_toolkit::{
             globals::{
                 BindError,
                 GlobalError,
+                GlobalListContents,
                 registry_queue_init,
             },
             protocol::{
@@ -128,6 +109,19 @@ use tracing::{
     debug,
     warn,
 };
+use vello::{
+    Renderer,
+    Scene,
+    kurbo::{
+        Affine,
+        Circle,
+        Rect,
+    },
+    peniko::{
+        Brush,
+        color::palette,
+    },
+};
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1::{
         self,
@@ -137,6 +131,13 @@ use wayland_protocols::wp::fractional_scale::v1::client::{
         self,
         WpFractionalScaleV1,
     },
+};
+use wgpu::Extent3d;
+
+use crate::{
+    InputEvent,
+    Program,
+    RenderContext,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -152,28 +153,20 @@ pub enum Error {
     #[error("Calloop Error")]
     Calloop(#[from] calloop::Error),
 
-    #[error("Wgpu Error")]
-    Wgpu(#[from] WgpuError),
-}
+    #[error("Request Adapter Error")]
+    RequestAdapter(#[from] wgpu::RequestAdapterError),
+    #[error("Request Device Error")]
+    RequestDevice(#[from] wgpu::RequestDeviceError),
 
-#[derive(Clone)]
-struct UnsafeLoopHandle<LH>(Arc<LH>);
-
-#[allow(clippy::non_send_fields_in_send_ty)]
-unsafe impl<LH> Send for UnsafeLoopHandle<LH> {}
-unsafe impl<LH> Sync for UnsafeLoopHandle<LH> {}
-impl<LH> Deref for UnsafeLoopHandle<LH> {
-    type Target = LH;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref()
-    }
+    #[error("Vello Renderer Error")]
+    Vello(#[from] vello::Error),
 }
 
 #[allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
-pub fn run<F>(render_fn: F) -> Result<(), Error>
+pub fn run<P, F>(program_builder: F) -> Result<(), Error>
 where
-    F: Fn(&egui::Context) + Sync + Send + 'static,
+    P: Program + 'static,
+    F: Fn() -> P + 'static,
 {
     let conn = Connection::connect_to_env()?;
     let (globals, event_queue) = registry_queue_init(&conn)?;
@@ -184,16 +177,55 @@ where
     let mut event_loop: EventLoop<App> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
 
-    WaylandSource::new(conn, event_queue)
+    WaylandSource::new(conn.clone(), event_queue)
         .insert(loop_handle.clone())
         .expect("Failed to insert EventLoop into WaylandSource");
-
-    #[allow(clippy::arc_with_non_send_sync)]
-    let loop_handle = UnsafeLoopHandle(Arc::new(loop_handle.clone()));
 
     let compositor = CompositorState::bind(&globals, &queue_handle)?;
     let layer_shell = LayerShell::bind(&globals, &queue_handle)?;
     let xdg_shell = XdgShell::bind(&globals, &queue_handle)?;
+
+    // Init WGPU
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
+
+    let dummy_surface = compositor.create_surface(&queue_handle);
+    let dummy_surface_wgpu = {
+        let display_handle = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
+            NonNull::new(conn.backend().display_ptr().cast()).expect("Wayland provided nullptr"),
+        ));
+        let surface_handle = RawWindowHandle::Wayland(WaylandWindowHandle::new(
+            NonNull::new(dummy_surface.id().as_ptr().cast()).expect("Wayland provided nullptr"),
+        ));
+        unsafe {
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: display_handle,
+                raw_window_handle:  surface_handle,
+            })
+        }
+        .expect("Failed to create Wgpu Surface")
+    };
+
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        compatible_surface:     Some(&dummy_surface_wgpu),
+        power_preference:       wgpu::PowerPreference::LowPower,
+        force_fallback_adapter: false,
+    }))?;
+    dummy_surface.destroy();
+
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label:             Some("vello_device"),
+        required_features: wgpu::Features::empty(),
+        required_limits:   wgpu::Limits::default(),
+        memory_hints:      wgpu::MemoryHints::default(),
+        trace:             wgpu::Trace::Off,
+    }))?;
+
+    let renderer = vello::Renderer::new(&device, vello::RendererOptions {
+        use_cpu:              false,
+        antialiasing_support: vello::AaSupport::all(),
+        num_init_threads:     None,
+        pipeline_cache:       None, // TODO: Investigate
+    })?;
 
     let mut app = App {
         registry_state: RegistryState::new(&globals),
@@ -208,9 +240,18 @@ where
         layer_shell,
         xdg_shell,
 
+        instance,
+        adapter,
+        device,
+        queue,
+
+        renderer,
+        font_context: parley::FontContext::new(),
+        layout_context: parley::LayoutContext::new(),
+
         displays: HashMap::new(),
         surfaces: HashMap::new(),
-        render_fn: Arc::new(render_fn),
+        program_builder: Box::new(move || Box::new(program_builder())),
     };
 
     loop {
@@ -220,7 +261,7 @@ where
 }
 
 struct App {
-    loop_handle: UnsafeLoopHandle<LoopHandle<'static, Self>>,
+    loop_handle: LoopHandle<'static, Self>,
 
     registry_state: RegistryState,
     seat_state:     SeatState,
@@ -233,23 +274,27 @@ struct App {
     layer_shell: LayerShell,
     xdg_shell:   XdgShell,
 
+    instance: wgpu::Instance,
+    adapter:  wgpu::Adapter,
+    device:   wgpu::Device,
+    queue:    wgpu::Queue,
+
+    renderer:       Renderer,
+    font_context:   parley::FontContext,
+    layout_context: parley::LayoutContext<Brush>,
+
     displays: HashMap<WlOutput, Display>,  // WlOutput
     surfaces: HashMap<WlSurface, Surface>, // WlSurface
 
-    render_fn: Arc<dyn Fn(&egui::Context) + Send + Sync + 'static>,
+    program_builder: Box<dyn Fn() -> Box<dyn Program>>,
 }
 
 struct Display {
-    _instance:    wgpu::Instance,
-    render_state: RenderState,
-    layer_root:   LayerSurface,
+    layer_root: LayerSurface,
+    last_time:  Option<Duration>,
 
-    egui_context: egui::Context,
-    egui_input:   egui::RawInput,
-
-    scale:     f32,
-    surfaces:  HashMap<WlSurface, wgpu::Surface<'static>>, // WlSurface
-    render_fn: Arc<dyn Fn(&egui::Context) + Send + Sync + 'static>,
+    scale:    f32,
+    surfaces: HashMap<WlSurface, wgpu::Surface<'static>>, // WlSurface
 }
 
 impl App {
@@ -257,19 +302,8 @@ impl App {
         &self,
         conn: &Connection,
         layer: LayerSurface,
-        qh: &QueueHandle<Self>,
-        render_fn: Arc<dyn Fn(&egui::Context) + Send + Sync + 'static>,
+        _qh: &QueueHandle<Self>,
     ) -> Display {
-        let wgpu_config = WgpuConfiguration {
-            wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(WgpuSetupCreateNew {
-                power_preference: egui_wgpu::wgpu::PowerPreference::LowPower,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let instance = wgpu::Instance::new(&InstanceDescriptor::from_env_or_default());
-
         let surface_wgpu = {
             let display_handle = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
                 NonNull::new(conn.backend().display_ptr().cast())
@@ -280,226 +314,176 @@ impl App {
                     .expect("Wayland provided nullptr"),
             ));
             unsafe {
-                instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                    raw_display_handle: display_handle,
-                    raw_window_handle:  surface_handle,
-                })
+                self.instance
+                    .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                        raw_display_handle: display_handle,
+                        raw_window_handle:  surface_handle,
+                    })
             }
             .expect("Failed to create Wgpu Surface")
         };
-
-        let render_state = pollster::block_on(RenderState::create(
-            &wgpu_config,
-            &instance,
-            Some(&surface_wgpu),
-            RendererOptions::default(),
-        ))
-        .expect("Failed to init wgpu instance");
-
-        let ctx = egui::Context::default();
-
-        let loop_handle = self.loop_handle.clone();
-        let queue_handle = qh.clone();
-
-        ctx.set_embed_viewports(false);
-        ctx.set_request_repaint_callback(
-            move |RequestRepaintInfo {
-                      viewport_id,
-                      delay,
-                      current_cumulative_pass_nr: _,
-                  }| {
-                let timer = Timer::from_duration(delay);
-                let queue_handle = queue_handle.clone();
-
-                loop_handle
-                    .insert_source(timer, move |_event, (), ctx| {
-                        if let Some(layer) =
-                            ctx.surfaces.values().find(|v| v.viewport_id == viewport_id)
-                        {
-                            layer.wayland.frame(&queue_handle, layer.wayland.clone());
-                            layer.wayland.commit();
-                        }
-
-                        TimeoutAction::Drop
-                    })
-                    .expect("Failed to add request_repaint into eventloop");
-            },
-        );
 
         #[allow(clippy::mutable_key_type)]
         let mut surfaces = HashMap::new();
         surfaces.insert(layer.wl_surface().clone(), surface_wgpu);
 
         Display {
-            _instance: instance,
-            render_state,
             layer_root: layer,
+            last_time: None,
 
             scale: 1.0,
             surfaces,
-
-            egui_context: ctx,
-            egui_input: egui::RawInput::default(),
-            render_fn,
         }
     }
 }
 
 struct Surface {
-    viewport_id: ViewportId,
+    output: WlOutput,
 
-    wayland: WlSurface,
-    output:  WlOutput,
+    size:     (u32, u32),
+    callback: Box<dyn Program>,
 
-    _fractional: WpFractionalScaleV1,
+    input_events: Vec<InputEvent>,
+    _fractional:  WpFractionalScaleV1,
 }
 
-impl Display {
+impl App {
     #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
     fn draw(
         &mut self,
-        viewport_id: ViewportId,
         surface: &WlSurface,
+        qh: &QueueHandle<Self>,
     ) {
-        let mut input = self.egui_input.take();
-
-        let callback = if let Some(callback) = self
-            .egui_context
-            .viewport_for(viewport_id, |state| state.viewport_ui_cb.clone())
-        {
-            callback
-        } else if viewport_id == ViewportId::ROOT {
-            self.render_fn.clone()
-        } else {
-            warn!("Immediate Callback");
+        let Some(info) = self.surfaces.get_mut(surface) else {
+            warn!("Attempted draw on unregistered WlSurface");
             return;
         };
 
-        let wgpu_surface = &self
-            .surfaces
-            .get(surface)
-            .expect("Surface not configured before WlSurface::frame");
-        let surface_texture = wgpu_surface
-            .get_current_texture()
-            .expect("failed to acquire next swapchain texture");
-        let texture_view = surface_texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let screen_descriptor = ScreenDescriptor {
-            size_in_pixels:   [
-                surface_texture.texture.width(),
-                surface_texture.texture.height(),
-            ],
-            pixels_per_point: input.viewport().native_pixels_per_point.unwrap_or(1.0)
-                * self.egui_context.zoom_factor(),
+        let Some(display) = self.displays.get(&info.output) else {
+            warn!("Attempted draw on unregistered WlOutput");
+            return;
         };
 
-        input.screen_rect = (screen_descriptor.size_in_pixels[0] > 0
-            && screen_descriptor.size_in_pixels[1] > 0)
-            .then(|| {
-                egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::Vec2::new(
-                        screen_descriptor.size_in_pixels[0] as f32
-                            / screen_descriptor.pixels_per_point,
-                        screen_descriptor.size_in_pixels[1] as f32
-                            / screen_descriptor.pixels_per_point,
-                    ),
-                )
+        let mut events = Vec::new();
+        std::mem::swap(&mut info.input_events, &mut events);
+
+        let (width, height) = info.size;
+        if width == 0 || height == 0 {
+            warn!("Attempted render on unconfigured WlSurface");
+            return;
+        }
+
+        let mut context = RenderContext {
+            scene: vello::Scene::new(),
+            events,
+
+            viewport_info: crate::ViewportInfo {
+                window_size: info.size,
+                pixel_scale: display.scale,
+            },
+
+            font_context: &mut self.font_context,
+            layout_context: &mut self.layout_context,
+
+            requested_redraw: None,
+            current_time: display.last_time.unwrap_or_default(),
+        };
+
+        info.callback.draw(&mut context);
+
+        if let Some(redraw) = context.requested_redraw {
+            let surface = surface.clone();
+            let queue_handle = qh.clone();
+
+            _ = self
+                .loop_handle
+                .insert_source(Timer::from_duration(redraw), move |_, (), ctx| {
+                    if ctx.surfaces.contains_key(&surface) {
+                        surface.frame(&queue_handle, surface.clone());
+                        surface.commit();
+                    }
+
+                    TimeoutAction::Drop
+                });
+        }
+
+        let RenderContext { scene, .. } = context;
+
+        let Some(display) = self.displays.get(&info.output) else {
+            warn!("Unregistered WlOutput");
+            return;
+        };
+
+        let Some(surface_wgpu) = display.surfaces.get(surface) else {
+            warn!("WlSurface not Configured");
+            return;
+        };
+        let surface_texture = surface_wgpu
+            .get_current_texture()
+            .expect("Failed to get SurfaceTexture");
+
+        let render_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label:           Some("vello_render_texture"),
+            size:            wgpu::Extent3d {
+                depth_or_array_layers: 1,
+                width,
+                height,
+            },
+            mip_level_count: 1,
+            sample_count:    1,
+            dimension:       wgpu::TextureDimension::D2,
+            format:          wgpu::TextureFormat::Rgba8Unorm,
+            usage:           wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats:    &[wgpu::TextureFormat::Rgba8Unorm],
+        });
+
+        let texture_view = render_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        if self
+            .renderer
+            .render_to_texture(
+                &self.device,
+                &self.queue,
+                &scene,
+                &texture_view,
+                &vello::RenderParams {
+                    base_color: palette::css::TRANSPARENT,
+                    width,
+                    height,
+                    antialiasing_method: vello::AaConfig::Msaa16,
+                },
+            )
+            .is_err()
+        {
+            tracing::error!("Failed to render!");
+            return;
+        }
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("vello_encoder"),
             });
 
-        //debug!(events = ?input.events, ?viewport, time = ?input.time);
-        input.viewport_id = viewport_id;
-        let output = self.egui_context.run(input, callback.as_ref());
+        let blit =
+            wgpu::util::TextureBlitterBuilder::new(&self.device, surface_texture.texture.format())
+                .blend_state(wgpu::BlendState::ALPHA_BLENDING)
+                .build();
+        blit.copy(
+            &self.device,
+            &mut encoder,
+            &texture_view,
+            &surface_texture
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("surface_texture"),
+                    //usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
+                    ..Default::default()
+                }),
+        );
 
-        let prims = self
-            .egui_context
-            .tessellate(output.shapes, screen_descriptor.pixels_per_point);
-
-        let mut encoder =
-            self.render_state
-                .device
-                .create_command_encoder(&CommandEncoderDescriptor {
-                    label: Some("egui_encoder"),
-                });
-
-        {
-            let mut state = self.render_state.renderer.write();
-
-            for (id, delta) in output.textures_delta.set {
-                state.update_texture(
-                    &self.render_state.device,
-                    &self.render_state.queue,
-                    id,
-                    &delta,
-                );
-            }
-
-            state.update_buffers(
-                &self.render_state.device,
-                &self.render_state.queue,
-                &mut encoder,
-                &prims,
-                &screen_descriptor,
-            );
-        }
-
-        {
-            let mut render_pass = encoder
-                .begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label:                    Some("egui_render"),
-                    color_attachments:        &[Some(RenderPassColorAttachment {
-                        view:           &texture_view,
-                        depth_slice:    None,
-                        resolve_target: None,
-                        ops:            Operations {
-                            load:  wgpu::LoadOp::Clear(Color::TRANSPARENT),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes:         None,
-                    occlusion_query_set:      None,
-                })
-                .forget_lifetime();
-
-            let state = self.render_state.renderer.read();
-            state.render(&mut render_pass, &prims, &screen_descriptor);
-        }
-
-        self.render_state.queue.submit([encoder.finish()]);
+        self.queue.submit(std::iter::once(encoder.finish()));
         surface_texture.present();
-
-        {
-            let mut state = self.render_state.renderer.write();
-
-            for id in output.textures_delta.free {
-                state.free_texture(&id);
-            }
-        }
-
-        // Request next frame
-        // surface.frame(qh, surface.clone());
-        // surface.commit();
-
-        let mut to_remove = Vec::new();
-        for surface in self.surfaces.keys() {
-            if !output
-                .viewport_output
-                .contains_key(&ViewportId::from_hash_of(surface.id()))
-                && surface != self.layer_root.wl_surface()
-            {
-                to_remove.push(surface.clone());
-            }
-        }
-
-        for surface in to_remove {
-            self.surfaces.remove(&surface);
-            self.egui_input
-                .viewports
-                .remove(&ViewportId::from_hash_of(surface.id()));
-        }
     }
 }
 
@@ -538,39 +522,28 @@ impl CompositorHandler for App {
     fn frame(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         surface: &WlSurface,
         time: u32,
     ) {
-        let time = Duration::from_millis(u64::from(time)).as_secs_f64();
+        let time = Duration::from_millis(u64::from(time));
 
-        let Some(surface) = self.surfaces.get(surface) else {
+        let Some(info) = self.surfaces.get(surface) else {
             warn!("Unassigned WlSurface");
             return;
         };
 
-        let output = surface.output.clone();
-        let Some(display) = self.displays.get_mut(&output) else {
-            warn!("Unassigned WlSurface");
-            return;
-        };
+        {
+            let output = info.output.clone();
+            let Some(display) = self.displays.get_mut(&output) else {
+                warn!("Unassigned WlSurface");
+                return;
+            };
 
-        let Some(viewport_id) = self.surfaces.get(&surface.wayland).map(|s| s.viewport_id) else {
-            warn!("Viewport doesn't exist for surface");
-            return;
-        };
+            display.last_time = Some(time);
+        }
 
-        display.egui_input.time = Some(time);
-        display.draw(viewport_id, &surface.wayland);
-
-        self.surfaces.retain(|_, surface| {
-            surface.output != output
-                || display
-                    .egui_input
-                    .viewports
-                    .contains_key(&ViewportId::from_hash_of(surface.wayland.id()))
-                || *display.layer_root.wl_surface() == surface.wayland
-        });
+        self.draw(surface, qh);
     }
 
     fn surface_enter(
@@ -626,17 +599,16 @@ impl OutputHandler for App {
         );
 
         self.surfaces.insert(layer.wl_surface().clone(), Surface {
-            viewport_id: ViewportId::ROOT,
-            wayland:     layer.wl_surface().clone(),
-            output:      output.clone(),
+            output:   output.clone(),
+            callback: (self.program_builder)(),
+            size:     (40, 0),
 
-            _fractional: fractional,
+            input_events: Vec::new(),
+            _fractional:  fractional,
         });
 
-        self.displays.insert(
-            output,
-            self.new_display(conn, layer, qh, self.render_fn.clone()),
-        );
+        self.displays
+            .insert(output, self.new_display(conn, layer, qh));
     }
 
     fn update_output(
@@ -655,7 +627,13 @@ impl OutputHandler for App {
         _qh: &QueueHandle<Self>,
         output: WlOutput,
     ) {
-        _ = self.displays.remove(&output);
+        let Some(display) = self.displays.remove(&output) else {
+            return;
+        };
+
+        for id in display.surfaces.keys() {
+            self.surfaces.remove(id);
+        }
     }
 }
 impl SeatHandler for App {
@@ -784,29 +762,12 @@ impl KeyboardHandler for Window {
 }
 */
 
-const fn from_raw_button(code: u32) -> egui::PointerButton {
-    use smithay_client_toolkit::seat::pointer::{
-        BTN_BACK,
-        BTN_FORWARD,
-        BTN_MIDDLE,
-        BTN_RIGHT,
-    };
-
-    match code {
-        BTN_RIGHT => egui::PointerButton::Secondary,
-        BTN_MIDDLE => egui::PointerButton::Middle,
-        BTN_BACK => egui::PointerButton::Extra1,
-        BTN_FORWARD => egui::PointerButton::Extra2,
-        _ => egui::PointerButton::Primary,
-    }
-}
-
 impl PointerHandler for App {
     #[allow(clippy::cast_possible_truncation)]
     fn pointer_frame(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _pointer: &WlPointer,
         events: &[PointerEvent],
     ) {
@@ -816,65 +777,61 @@ impl PointerHandler for App {
             kind,
         } in events
         {
-            let Some(surface) = self.surfaces.get(surface) else {
+            let Some(info) = self.surfaces.get_mut(surface) else {
                 warn!("Unregistered WlSurface");
                 continue;
             };
 
-            let Some(display) = self.displays.get_mut(&surface.output) else {
-                warn!("WlSurface attached to Unregistered WlOutput");
-                continue;
-            };
-
-            let pixel_scale = (display.scale * display.egui_context.zoom_factor()).recip();
-            let pos = egui::pos2(*pos_x as f32 * pixel_scale, *pos_y as f32 * pixel_scale);
-
+            let (x, y) = (*pos_x, *pos_y);
             let event = match kind {
-                PointerEventKind::Enter { serial: _ } | PointerEventKind::Motion { time: _ } => {
-                    egui::Event::PointerMoved(pos)
+                PointerEventKind::Enter { serial: _ } => InputEvent::PointerEnter { x, y },
+                PointerEventKind::Leave { serial: _ } => InputEvent::PointerLeave,
+
+                PointerEventKind::Press {
+                    time,
+                    button,
+                    serial: _,
+                } => InputEvent::PointerButton {
+                    time:   Duration::from_millis(u64::from(*time)),
+                    button: *button,
+                    state:  true,
+                },
+                PointerEventKind::Release {
+                    time,
+                    button,
+                    serial: _,
+                } => InputEvent::PointerButton {
+                    time:   Duration::from_millis(u64::from(*time)),
+                    button: *button,
+                    state:  false,
+                },
+
+                PointerEventKind::Motion { time } => InputEvent::PointerMove {
+                    time: Duration::from_millis(u64::from(*time)),
+                    x,
+                    y,
                 },
                 PointerEventKind::Axis {
-                    time: _,
+                    time,
                     horizontal,
                     vertical,
                     source: _,
-                } => egui::Event::MouseWheel {
-                    unit:      egui::MouseWheelUnit::Point,
-                    delta:     egui::Vec2 {
-                        x: horizontal.absolute as f32,
-                        y: vertical.absolute as f32,
-                    },
-                    modifiers: egui::Modifiers::default(), // FIXME: Modifiers
+                } => {
+                    let horizontal = f64::from(horizontal.value120) / 120.0;
+                    let vertical = f64::from(vertical.value120) / 120.0;
+
+                    InputEvent::PointerAxis {
+                        time: Duration::from_millis(u64::from(*time)),
+                        horizontal,
+                        vertical,
+                    }
                 },
-                PointerEventKind::Press {
-                    time: _,
-                    button,
-                    serial: _,
-                } => egui::Event::PointerButton {
-                    pos,
-                    button: from_raw_button(*button),
-                    pressed: true,
-                    modifiers: egui::Modifiers::default(), // FIXME: Modifiers
-                },
-                PointerEventKind::Release {
-                    time: _,
-                    button,
-                    serial: _,
-                } => egui::Event::PointerButton {
-                    pos,
-                    button: from_raw_button(*button),
-                    pressed: false,
-                    modifiers: egui::Modifiers::default(), // FIXME: Modifiers
-                },
-                PointerEventKind::Leave { serial: _ } => egui::Event::PointerGone,
             };
+            info.input_events.push(event);
 
-            display.egui_input.events.push(event);
-
-            if let Some(surface) = self.surfaces.get(&surface.wayland) {
-                let viewport = surface.viewport_id;
-                display.egui_context.request_repaint_of(viewport);
-            }
+            // Request frame
+            surface.frame(qh, surface.clone());
+            surface.commit();
         }
     }
 }
@@ -907,36 +864,33 @@ impl LayerShellHandler for App {
     fn configure(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        let Some(surface) = self.surfaces.get(layer.wl_surface()) else {
+        let Some(info) = self.surfaces.get_mut(layer.wl_surface()) else {
             warn!("Unregistered WlSurface");
             return;
         };
 
-        let Some(display) = self.displays.get_mut(&surface.output) else {
+        let Some(display) = self.displays.get_mut(&info.output) else {
             warn!("WlSurface attached to Unregistered WlOutput");
             return;
         };
 
-        let Some(surface_wgpu) = display.surfaces.get(&surface.wayland) else {
+        let Some(surface_wgpu) = display.surfaces.get(layer.wl_surface()) else {
             warn!("WGPU surface not created!");
             return;
         };
 
         let (width, height) = configure.new_size;
 
-        let cap = surface_wgpu.get_capabilities(&display.render_state.adapter);
-        let prefrered_format = egui_wgpu::preferred_framebuffer_format(&cap.formats)
-            .expect("No supported Framebuffer format");
-
+        let cap = surface_wgpu.get_capabilities(&self.adapter);
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: prefrered_format,
-            view_formats: vec![prefrered_format],
+            format: cap.formats[0],
+            view_formats: vec![cap.formats[0]],
             alpha_mode: wgpu::CompositeAlphaMode::PreMultiplied,
             width,
             height,
@@ -944,12 +898,14 @@ impl LayerShellHandler for App {
             // Wayland is inherently a mailbox system.
             present_mode: wgpu::PresentMode::Mailbox,
         };
-        surface_wgpu.configure(&display.render_state.device, &surface_config);
-
-        display.draw(ViewportId::ROOT, &surface.wayland);
-        display.egui_context.request_repaint_of(ViewportId::ROOT);
+        surface_wgpu.configure(&self.device, &surface_config);
+        info.size = configure.new_size;
 
         debug!(id = ?layer.wl_surface().id(), width, height, "Configured");
+
+        self.draw(layer.wl_surface(), qh);
+        layer.wl_surface().frame(qh, layer.wl_surface().clone());
+        layer.wl_surface().commit();
     }
 }
 
