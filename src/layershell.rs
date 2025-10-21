@@ -1,8 +1,6 @@
 use std::{
     collections::HashMap,
-    ops::Deref,
     ptr::NonNull,
-    sync::Arc,
     time::Duration,
 };
 
@@ -50,7 +48,6 @@ use smithay_client_toolkit::{
             globals::{
                 BindError,
                 GlobalError,
-                GlobalListContents,
                 registry_queue_init,
             },
             protocol::{
@@ -111,12 +108,6 @@ use tracing::{
 };
 use vello::{
     Renderer,
-    Scene,
-    kurbo::{
-        Affine,
-        Circle,
-        Rect,
-    },
     peniko::{
         Brush,
         color::palette,
@@ -132,7 +123,6 @@ use wayland_protocols::wp::fractional_scale::v1::client::{
         WpFractionalScaleV1,
     },
 };
-use wgpu::Extent3d;
 
 use crate::{
     InputEvent,
@@ -290,10 +280,10 @@ struct App {
 }
 
 struct Display {
-    layer_root: LayerSurface,
-    last_time:  Option<Duration>,
+    _layer_root: LayerSurface,
+    last_time:   Option<Duration>,
 
-    scale:    f32,
+    scale:    f64,
     surfaces: HashMap<WlSurface, wgpu::Surface<'static>>, // WlSurface
 }
 
@@ -328,7 +318,7 @@ impl App {
         surfaces.insert(layer.wl_surface().clone(), surface_wgpu);
 
         Display {
-            layer_root: layer,
+            _layer_root: layer,
             last_time: None,
 
             scale: 1.0,
@@ -374,19 +364,16 @@ impl App {
         }
 
         let mut context = RenderContext {
-            scene: vello::Scene::new(),
-            events,
+            scene:  vello::Scene::new(),
+            events: &events,
 
-            viewport_info: crate::ViewportInfo {
-                window_size: info.size,
-                pixel_scale: display.scale,
-            },
+            viewport_info: crate::ViewportInfo::from_pixel_size(width, height, display.scale),
 
-            font_context: &mut self.font_context,
+            font_context:   &mut self.font_context,
             layout_context: &mut self.layout_context,
 
             requested_redraw: None,
-            current_time: display.last_time.unwrap_or_default(),
+            current_time:     display.last_time.unwrap_or_default(),
         };
 
         info.callback.draw(&mut context);
@@ -505,9 +492,7 @@ impl CompositorHandler for App {
             return;
         };
 
-        #[allow(clippy::cast_precision_loss)]
-        let scale = new_factor as f32;
-        display.scale = scale;
+        display.scale = f64::from(new_factor);
     }
 
     fn transform_changed(
@@ -986,8 +971,7 @@ impl Dispatch<WpFractionalScaleV1, WlSurface> for App {
                     return;
                 };
 
-                #[allow(clippy::cast_precision_loss)]
-                let scale = scale as f32 / 120.0;
+                let scale = f64::from(scale) / 120.0;
                 display.scale = scale;
             },
             _ => unreachable!(),
